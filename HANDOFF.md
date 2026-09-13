@@ -34,6 +34,21 @@ baseline/설명의 남은 무시 조합·캐시 경합 가정 문서화)을 반�
 - 브리지 스캐너 디스패치(`scanBridgeFiles`)·skill/init(`TemplateInstaller`)·`ValueFlowLimits.standard`+`resolved` 일원화.
 - 죽은 public API(`Baseline.merging`, `CodeGraph.filteringEdges`)는 internal 로 내린 뒤 **자기 분석 `dead --strict` 이 도달 불가로 잡아** 삭제했다 — 도구가 다시 실물 결함을 찾은 사례.
 
+### 배포: 0.12.0 (2026-09-13)
+
+버전 올림은 [PR #86](https://github.com/ictechgy/cartograph/pull/86)으로 머지(`4556fdc`)하고 태그
+`0.12.0`을 발행해 릴리스 워크플로(12분 7초, 유니버설 빌드 후 압축 푼 바이너리로 계약·픽스처·블라인드스팟
+재검증)를 통과시켰다. GitHub Release 공개. `.claude-plugin/plugin.json` 은 0.9.0 에서 밀려 있던 것을
+0.12.0 으로 함께 맞췄다.
+
+- **자산 독립 검증(이번엔 샌드박스에서 직접 했다)**: tarball 을 내려받아 sha256 재계산 — 노트의 값과
+  일치(`14975efe…7f4e5`), `lipo -info` 로 x86_64+arm64 확인, `--version` = 0.12.0, 그 바이너리로
+  이 저장소 자기 분석(`dead --strict`, `cycles --level type --strict`) 0 findings. 과거 세션과 달리
+  `release-assets.githubusercontent.com` 이 열려 있어 바이트 검증이 가능했다.
+- **Homebrew tap**: `HOMEBREW_TAP_TOKEN` 이 여전히 없어 워크플로가 건너뛰었고, 세션 토큰으로 수동
+  갱신했다(tap `5e5b541`). 원격 수식의 url·sha256 을 API 로 대조해 릴리스 자산과 일치를 확인했다.
+  수식에 명시적 `version` 줄은 없고 URL 파일명에서 파생된다.
+
 ### 도구 캐시의 TMPDIR 존중
 
 `cartograph-index-db`(인덱스 판독기 DB)와 `cartograph-syntax-cache` 가 `TemporaryBase.directory()` 로
