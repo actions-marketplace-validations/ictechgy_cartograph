@@ -1,5 +1,55 @@
 # Handoff
 
+## 2026-09-13 — 5렌즈 감사(성능·보안·구조·기능·사용성) 후속 수정 완료 (PR #85)
+
+사용자 요청으로 전체 재검토를 돌리고 도출된 지적을 [PR #85](https://github.com/ictechgy/cartograph/pull/85)로
+`cdcfcb6` 로 스쿼시 머지했다. GLM high 패킷 리뷰 1회를 거쳐 지적 4건(빈 candidates 정규화·추천 중복·
+baseline/설명의 남은 무시 조합·캐시 경합 가정 문서화)을 반영했고, CI 두 잡(커버리지 게이트 포함) 통과 후 머지했다.
+
+### 사용자 관점 행동 변화 (문서도 갱신됨)
+
+1. **notFound 추천**: `query` notFound 가 `candidates`(qualifiedName·USR·위치)를 싣고 단건 stderr 는
+   이름을 반향한다. `cycles`/`rules --explain` 도 추천. 비슷한 이름이 없으면 키 자체가 빠진다.
+2. **미지원 플래그 64 거부**: `query`·`graph`·`bridges`의 `--report-format`·`--strict`, `dataflow`의
+   `--strict`, `baseline`의 `--report-format`·`--strict`, `dead --explain`의 `--report-test-only`.
+3. **cycles·rules·metrics 도 `limitations` 를 싣는다** — 지표 JSON 에 선택 키, 표에는 `Limitation:` 행.
+4. **`baseline_path` 는 읽기 전용 키가 됐다.** `cartograph baseline` 은 `--write` 또는 프로젝트 루트
+   기본값에만 쓴다. 설정이 `baseline_path` 를 갖고 `--write` 가 없으면 64. (임의 경로 덮어쓰기 차단)
+5. **`retained_names: ["init"]` 이 실패 가능 이니셜라이저와 맞는다** — 이름 정규화가
+   `GraphNode.baseName(ofIndexName:)` 한 곳으로 모이면서 Core 규칙의 `init?` 잔류 결함이 사라졌다.
+
+### 보안 경화
+
+- Xcode·Checkstyle 리포터의 제어 문자 정화(PR #80 이 GHA 에만 넣었던 것). 필터는
+  `CartographCore/Support/PrintableText.swift` 한 곳이고 GHA 의 `%0A` 인코딩 동작은 보존
+  (`keepingLineBreaks: true`). `ExternalRetention.printable` 과 GHA `sanitize` 는 위임으로 바뀌었다.
+- git 조회가 `-c core.fsmonitor=false --no-optional-locks` 로 실행된다(`ChangedFiles`).
+
+### 성능·구조 (출력 동일, 자기 분석으로 확인)
+
+- 기준 경로 표기 펼치기 실행당 1회(`SourceLocation.relative(toBaseVariants:)` 추가, `PathFilter.variants` public).
+- `RetentionPolicy` 경로 판정 메모이제이션 + `PathFilter.removes` 빈 패턴 조기 종료.
+- `LayerRuleEvaluator.assess(graph:)` — 배정 맵 1회. `AnalysisContext` 레벨별 그래프 캐시(경합 시 중복 계산 가능을 주석으로 못박음).
+- 배치 질의 지문 집합 1회 해싱, HTML/Mermaid 차수 사전 계산(`CodeGraph.totalDegrees()`), `dataflow` 필드·클로저 색인.
+- 브리지 스캐너 디스패치(`scanBridgeFiles`)·skill/init(`TemplateInstaller`)·`ValueFlowLimits.standard`+`resolved` 일원화.
+- 죽은 public API(`Baseline.merging`, `CodeGraph.filteringEdges`)는 internal 로 내린 뒤 **자기 분석 `dead --strict` 이 도달 불가로 잡아** 삭제했다 — 도구가 다시 실물 결함을 찾은 사례.
+
+### 도구 캐시의 TMPDIR 존중
+
+`cartograph-index-db`(인덱스 판독기 DB)와 `cartograph-syntax-cache` 가 `TemporaryBase.directory()` 로
+`TMPDIR` 환경 변수를 먼저 본다. 보통 macOS 에서 `TMPDIR` = `NSTemporaryDirectory()` 라 아무것도 옮기지
+않고, 사용자 임시 디렉터리가 가려진 실행기 아래에서는 이것이 없으면 인덱스 스토어가 올바라도 판독기 DB
+생성이 막혀 모든 분석이 2 로 죽는다.
+
+### 검증 (850 tests, CI 두 잡 통과)
+
+단위 850(신규 19건, 구현 되돌림으로 무는지 확인) · CLI 계약(거부 조합 12행 추가) · 픽스처 전 항목 ·
+자기 분석 4종 0 findings · CI 커버리지 게이트 통과. 이 샌드박스에서 `swift test` 직접 실행이 불가해
+CLT Testing 프레임워크 `-F` 빌드 + `--testing-library swift-testing` 러너로 재현했고, 커버리지는
+환경 실패 13건(### Known 아래 `/var/folders` 쓰기 차단)이 스킵되는 탓에 로컬 89.4% vs 동일 방법 main
+89.45%로 공정 비교해 환업임을 확인했다 — CI 게이트가 정본. `verify-fixtures.sh` 에 `SWIFTPM_FLAGS`
+통로, `verify-cli-contract.sh` 에 mktemp 템플릿을 넣어 가려진 환경에서도 스크립트가 돈다.
+
 ## 2026-09-11 — baseline·근거 경로 해결 일원화 및 JSON 이스케이프 정비 완료 (PR #83)
 
 감사 결과 후속 정비 항목 중 경로 해석 일원화 및 JSON 직렬화 안정성 작업을 [PR #83](https://github.com/ictechgy/cartograph/pull/83)으로 머지했다 (`f8af7d6`).
@@ -258,7 +308,7 @@ Isthmus `npm run verify` 통과. GLM packet-ask 검토 지적은 실패 재현 �
 
 새 세션이 이어받기 위한 문서다. 작업 규칙은 [AGENTS.md](AGENTS.md), Claude Code 전용 사항은 [CLAUDE.md](CLAUDE.md). 이 파일은 **지금 어디까지 왔고 다음이 무엇인지**만 담는다.
 
-_마지막 갱신: 2026-09-10 (성능·보안·구조 감사 완료 — PR #80 스쿼시 머지 완료)._
+_마지막 갱신: 2026-09-13 (5렌즈 감사 후속 수정 — PR #85 스쿼시 머지 완료)._
 
 
 ## 2026-09-08 — 0.8.2 신뢰성·성능 정비 (PR #62 머지)
