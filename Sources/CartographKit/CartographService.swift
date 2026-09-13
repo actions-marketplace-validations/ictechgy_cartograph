@@ -162,7 +162,9 @@ public struct CartographService: Sendable {
         try configuration.validate()
         let graph = context.buildGraph(level: level ?? configuration.level).graph
         let evaluator = LayerRuleEvaluator(layers: configuration.layers, rules: configuration.rules)
-        return (graph, evaluator.evaluate(graph: graph), evaluator.unassignedNodes(in: graph))
+        // 배정 맵(정점마다 글롭 대조)은 위반 판정과 미지정 수집이 함께 쓴다.
+        let (violations, unassigned) = evaluator.assess(graph: graph)
+        return (graph, violations, unassigned)
     }
 
     /// 특정 선언이 살아 있는 이유.
@@ -188,12 +190,15 @@ public struct CartographService: Sendable {
     public func detectCycles(level: GraphLevel? = nil) throws -> CommandOutcome {
         let context = try loadContext()
         let (graph, cycles) = cycles(in: context, level: level)
+        // 순환 검사도 CI 게이트다. 인덱스가 낡은 채로 "순환 없음"이 나가면 그
+        // 초록불은 아무것도 검사하지 않은 초록불이다. dead 와 같은 한계를 싣는다.
         return try finish(
             AnalysisDiagnostics.diagnostics(for: cycles, in: graph),
             command: "cycles",
             subject: describe(graph),
             thresholdLimit: configuration.thresholds.maxCycles,
             thresholdRule: AnalysisDiagnostics.Rule.cycle,
+            limitations: limitations(context: context, graph: graph, requestedLevel: level),
             caveat: emptyIndexCaveat(context)
         )
     }
@@ -229,7 +234,14 @@ public struct CartographService: Sendable {
 
         switch lookup {
         case .notFound:
-            return CommandOutcome(output: "No declaration matches '\(subject)'.\n", subjectNotFound: true)
+            return CommandOutcome(
+                output: Self.describeNotFound(
+                    subject,
+                    similar: GraphQueryIndex(graph: graph).similarCandidates(to: subject),
+                    noun: "declaration"
+                ),
+                subjectNotFound: true
+            )
         case let .ambiguous(candidates):
             return CommandOutcome(output: Self.describeCandidates(candidates, for: subject, in: graph))
         case let .found(node):
@@ -269,7 +281,14 @@ public struct CartographService: Sendable {
         let lookup = GraphQueryIndex(graph: graph).resolve(subject)
         switch lookup {
         case .notFound:
-            return CommandOutcome(output: "No node matches '\(subject)'.\n", subjectNotFound: true)
+            return CommandOutcome(
+                output: Self.describeNotFound(
+                    subject,
+                    similar: GraphQueryIndex(graph: graph).similarCandidates(to: subject),
+                    noun: "node"
+                ),
+                subjectNotFound: true
+            )
         case let .ambiguous(candidates):
             return CommandOutcome(output: Self.describeAmbiguity(subject, candidates: candidates))
         case let .found(node):
@@ -297,7 +316,14 @@ public struct CartographService: Sendable {
         let lookup = GraphQueryIndex(graph: graph).resolve(subject)
         switch lookup {
         case .notFound:
-            return CommandOutcome(output: "No node matches '\(subject)'.\n", subjectNotFound: true)
+            return CommandOutcome(
+                output: Self.describeNotFound(
+                    subject,
+                    similar: GraphQueryIndex(graph: graph).similarCandidates(to: subject),
+                    noun: "node"
+                ),
+                subjectNotFound: true
+            )
         case let .ambiguous(candidates):
             return CommandOutcome(output: Self.describeAmbiguity(subject, candidates: candidates))
         case let .found(node):
@@ -364,7 +390,42 @@ public struct CartographService: Sendable {
     public func query(symbol subject: String, depth: Int = 1, limit: Int = 50) throws -> CommandOutcome {
         let document = try queryDocument(symbol: subject, depth: depth, limit: limit)
         let text = try Self.encodeQuery(document)
-        return CommandOutcome(output: text, subjectNotFound: document.status == "notFound")
+        guard document.status == "notFound" else {
+            return CommandOutcome(output: text)
+        }
+        return CommandOutcome(
+            output: text,
+            subjectNotFound: true,
+            notFoundMessage: Self.singleQueryNotFoundMessage(document)
+        )
+    }
+
+    /// 단건 `query` 가 notFound 로 끝날 때 stderr 에 나갈 문구.
+    ///
+    /// JSON 은 이미 표준 출력으로 나간 뒤다. 요청한 이름을 그대로 반향하고,
+    /// 비슷한 이름이 있으면 같이 알려 준다. 이름 없이 "없다"만 말하면 부른 쪽은
+    /// 무엇을 되물어야 할지 모른다 — 오타가 오타라고 말하지 않는 답이 된다.
+    static func singleQueryNotFoundMessage(_ document: SymbolQueryDocument) -> String {
+        var message = "no declaration matches '\(document.requested)'"
+        let names = (document.candidates ?? []).map(\.qualifiedName)
+        if !names.isEmpty {
+            message += ". Similar names: " + names.joined(separator: ", ")
+                + " — the JSON above lists each with its location and USR"
+        }
+        return message
+    }
+
+    /// `--explain` 계열이 notFound 로 답할 때 쓰는 문장.
+    ///
+    /// 그래프는 이미 메모리에 있으므로 비슷한 이름 추천은 공짜다. 이름을 반향하지
+    /// 않으면 부른 쪽은 무엇이 틀렸는지 다시 추측해야 한다.
+    static func describeNotFound(
+        _ subject: String, similar: [GraphNode], noun: String
+    ) -> String {
+        let names = similar.map(\.qualifiedName)
+        guard !names.isEmpty else { return "No \(noun) matches '\(subject)'.\n" }
+        return "No \(noun) matches '\(subject)'. Similar names: "
+            + names.joined(separator: ", ") + ".\n"
     }
 
     /// 여러 선언을 한 번에 묻는다.
@@ -406,17 +467,22 @@ public struct CartographService: Sendable {
         /// 없으면 요청마다 파일을 다시 읽는다. 답은 같지만, 1000건 배치에서 33 밀리초를
         /// 파일 시스템에 쓰고 그 값은 베이스라인이 커질수록 커진다.
         let baseline: Baseline?
+        /// 억제 판정에 쓸 지문 집합. 답마다 `filtering` 을 부르면 답 수 × 지문 수의
+        /// 해싱이 매번 다시 일어난다.
+        let baselineFingerprints: Set<String>
     }
 
     func makeQuerySession() throws -> QuerySession {
         let context = try loadContext()
         let (graph, report) = unusedCode(in: context)
+        let baseline = try loadBaseline()
         return QuerySession(
             graph: graph,
             lookup: GraphQueryIndex(graph: graph),
             report: report,
             limitations: analysisLimitations(context: context, symbolGraph: graph),
-            baseline: try loadBaseline()
+            baseline: baseline,
+            baselineFingerprints: baseline.map { Set($0.fingerprints) } ?? []
         )
     }
 
@@ -436,8 +502,20 @@ public struct CartographService: Sendable {
 
         switch session.lookup.resolve(subject) {
         case .notFound:
+            // 오타가 오타라고 말만 하지 않는다. 그래프에 비슷한 이름이 있으면
+            // 다시 물을 수 있는 모양(위치·USR 포함)으로 같이 보낸다.
+            // 비슷한 이름이 없으면 키 자체를 만들지 않는다 — 빈 배열은
+            // "추천이 비었다"는 매번 붙는 말이 된다.
+            let similar = Self.candidates(
+                session.lookup.similarCandidates(to: subject),
+                in: graph
+            )
             return SymbolQueryDocument(
-                status: "notFound", requested: subject, level: level, limitations: limitations
+                status: "notFound",
+                requested: subject,
+                level: level,
+                limitations: limitations,
+                candidates: similar.isEmpty ? nil : similar
             )
         case let .ambiguous(candidates):
             return SymbolQueryDocument(
@@ -445,16 +523,7 @@ public struct CartographService: Sendable {
                 requested: subject,
                 level: level,
                 limitations: limitations,
-                candidates: Self.orderedCandidates(candidates, in: graph).map {
-                    .init(
-                        qualifiedName: $0.node.qualifiedName,
-                        usr: $0.node.usr ?? $0.node.id.rawValue,
-                        kind: $0.node.kind.rawValue,
-                        module: $0.node.module,
-                        location: $0.node.location,
-                        container: $0.container
-                    )
-                }
+                candidates: Self.candidates(candidates, in: graph)
             )
         case let .found(node):
             return SymbolQueryDocument(
@@ -464,7 +533,7 @@ public struct CartographService: Sendable {
                 limitations: limitations,
                 result: try describeQuery(
                     of: node, report: report, in: graph,
-                    depth: depth, limit: limit, baseline: session.baseline
+                    depth: depth, limit: limit, baselineFingerprints: session.baselineFingerprints
                 )
             )
         }
@@ -474,6 +543,22 @@ public struct CartographService: Sendable {
     struct OrderedCandidate {
         let node: GraphNode
         let container: String?
+    }
+
+    /// 정점 목록을 후보 문서로 바꾼다. 모호 판정과 notFound 추천이 같은 모양을 쓴다.
+    static func candidates(
+        _ nodes: [GraphNode], in graph: CodeGraph
+    ) -> [SymbolQueryDocument.Candidate] {
+        orderedCandidates(nodes, in: graph).map {
+            .init(
+                qualifiedName: $0.node.qualifiedName,
+                usr: $0.node.usr ?? $0.node.id.rawValue,
+                kind: $0.node.kind.rawValue,
+                module: $0.node.module,
+                location: $0.node.location,
+                container: $0.container
+            )
+        }
     }
 
     /// 후보를 사람이 훑는 순서로 세운다.
@@ -531,13 +616,13 @@ public struct CartographService: Sendable {
         in graph: CodeGraph,
         depth: Int,
         limit: Int,
-        baseline: Baseline?
+        baselineFingerprints: Set<String>
     ) throws -> SymbolQuery {
         let explanation = report.explain(node.id, in: graph)
         // 도달 가능한 정점에는 `dead` 가 애초에 진단을 내지 않는다. 그런데도 옛
         // 베이스라인 항목이 지문만 맞으면 억제되었다고 표시되어, "도달 가능한데
         // 팀이 억제했다"는 모순된 답이 나간다.
-        let suppressed = explanation == .unreachable && isSuppressed(node, by: baseline)
+        let suppressed = explanation == .unreachable && Self.isSuppressed(node, by: baselineFingerprints)
         let neighborhood = GraphNeighborhood(graph: graph)
         let (usedBy, usedByTruncated) = neighborhood.usage(
             of: node.id, depth: depth, limit: limit, incoming: true
@@ -562,9 +647,9 @@ public struct CartographService: Sendable {
         )
     }
 
-    private func isSuppressed(_ node: GraphNode, by baseline: Baseline?) -> Bool {
-        guard let baseline else { return false }
-        return baseline.filtering([Self.unusedDiagnostic(for: node)]).isEmpty
+    /// 지문 집합 하나로 억제 여부를 답한다. 답마다 Set 을 다시 만들지 않는다.
+    private static func isSuppressed(_ node: GraphNode, by fingerprints: Set<String>) -> Bool {
+        fingerprints.contains(Self.unusedDiagnostic(for: node).fingerprint)
     }
 
     private static func encodeQuery(_ document: SymbolQueryDocument) throws -> String {
@@ -698,30 +783,20 @@ public struct CartographService: Sendable {
             .provider.loadSnapshot()
         let resolver = BridgeSymbolResolver(snapshot: snapshot)
         let sources = bridgeSourceFiles()
-        var facts: [BridgeFact] = []
         var unreadable = 0
-        var unscannedEventChannels = 0
-        var unscannedMessageChannels = 0
-        var opaqueHandlerChannels: [String?] = []
         var objectiveCSources = 0
         var sourceCache: [String: String] = [:]
-        for path in sources {
-            guard let source = try? environment.fileSystem.readText(at: path) else { unreadable += 1; continue }
+        let firstPass = scanBridgeFiles(at: sources, resolver: resolver, resolvedValues: [:], canonicalizesPaths: false) {
+            path in
+            guard let source = try? environment.fileSystem.readText(at: path) else { unreadable += 1; return nil }
             sourceCache[ValueFlowSourceLoader.canonicalPath(path)] = source
             if !path.hasSuffix(".swift") { objectiveCSources += 1 }
-            if path.hasSuffix(".swift") {
-                let scanned = BridgeFactScanner().scan(source: source, path: path)
-                facts += resolver.resolve(scanned.facts)
-                unscannedEventChannels += scanned.unscannedEventChannels
-                unscannedMessageChannels += scanned.unscannedMessageChannels
-                opaqueHandlerChannels += scanned.opaqueHandlerChannels
-            } else {
-                facts += ReactNativeMacroScanner().scan(source: source, path: path)
-                let scanned = ObjectiveCFlutterScanner().scan(source: source, path: path)
-                facts += resolver.resolve(scanned.scannedFacts)
-                opaqueHandlerChannels += scanned.opaqueHandlerChannels
-            }
+            return source
         }
+        var facts = firstPass.facts
+        var opaqueHandlerChannels = firstPass.opaqueHandlerChannels
+        let unscannedEventChannels = firstPass.unscannedEventChannels
+        let unscannedMessageChannels = firstPass.unscannedMessageChannels
         let indexedDates = Dictionary((snapshot.indexedFileDates ?? [:]).map {
             (ValueFlowSourceLoader.canonicalPath($0.key), $0.value)
         }, uniquingKeysWith: min)
@@ -738,22 +813,11 @@ public struct CartographService: Sendable {
             let resolved = ValueFlowBridgeConstants().resolve(in: graph)
             if !resolved.isEmpty {
                 // 원래 사실을 위치별로 덧대지 않고 다시 스캔해 채널 바인딩과 핸들러가 같은 이름을 쓴다.
-                facts.removeAll()
-                opaqueHandlerChannels.removeAll()
-                for path in sources {
-                    guard let source = sourceCache[ValueFlowSourceLoader.canonicalPath(path)] else { continue }
-                    if path.hasSuffix(".swift") {
-                        let canonical = LocalFileSystem.canonicalPath(path)
-                        let scanned = BridgeFactScanner().scan(source: source, path: canonical, resolvedValues: resolved)
-                        facts += resolver.resolve(scanned.facts)
-                        opaqueHandlerChannels += scanned.opaqueHandlerChannels
-                    } else {
-                        facts += ReactNativeMacroScanner().scan(source: source, path: path)
-                        let scanned = ObjectiveCFlutterScanner().scan(source: source, path: path)
-                        facts += resolver.resolve(scanned.scannedFacts)
-                        opaqueHandlerChannels += scanned.opaqueHandlerChannels
-                    }
-                }
+                let secondPass = scanBridgeFiles(
+                    at: sources, resolver: resolver, resolvedValues: resolved, canonicalizesPaths: true
+                ) { sourceCache[ValueFlowSourceLoader.canonicalPath($0)] }
+                facts = secondPass.facts
+                opaqueHandlerChannels = secondPass.opaqueHandlerChannels
             }
         }
         let selectedFacts = target.map { selected in
@@ -781,6 +845,47 @@ public struct CartographService: Sendable {
             extraLimitations: extraLimitations,
             opaqueHandlerChannels: includesFlutter ? opaqueHandlerChannels : []
         )
+    }
+
+    /// 소스 파일들을 스캐너 한 벌에 흘려 보낸다.
+    ///
+    /// Swift 파일은 BridgeFactScanner, 그 밖은 React Native 매크로 스캐너와
+    /// Objective-C Flutter 스캐너가 맡는다. 초회 스캔과 해석 상수를 얻은 뒤의
+    /// 재스캔이 이 배치를 따로 두면, 네 번째 브리지 메커니즘이나 새 계수가
+    /// 늘 때 한쪽만 고쳐지는 자리가 된다.
+    ///
+    /// 재스캔은 경로를 정규화해 기록하고(realpath 프로젝트와의 표기 일치),
+    /// 채널 계수는 초회 패스만 센다 — 재스캔은 사실과 핸들러 표식만 갈아낀다.
+    private func scanBridgeFiles(
+        at paths: [String],
+        resolver: BridgeSymbolResolver,
+        resolvedValues: [SourceLocation: String],
+        canonicalizesPaths: Bool,
+        sourceAt: (String) -> String?
+    ) -> (facts: [BridgeFact], opaqueHandlerChannels: [String?], unscannedEventChannels: Int, unscannedMessageChannels: Int) {
+        var facts: [BridgeFact] = []
+        var opaqueHandlerChannels: [String?] = []
+        var unscannedEventChannels = 0
+        var unscannedMessageChannels = 0
+        for path in paths {
+            guard let source = sourceAt(path) else { continue }
+            if path.hasSuffix(".swift") {
+                let scanPath = canonicalizesPaths ? LocalFileSystem.canonicalPath(path) : path
+                let scanned = resolvedValues.isEmpty
+                    ? BridgeFactScanner().scan(source: source, path: scanPath)
+                    : BridgeFactScanner().scan(source: source, path: scanPath, resolvedValues: resolvedValues)
+                facts += resolver.resolve(scanned.facts)
+                opaqueHandlerChannels += scanned.opaqueHandlerChannels
+                unscannedEventChannels += scanned.unscannedEventChannels
+                unscannedMessageChannels += scanned.unscannedMessageChannels
+            } else {
+                facts += ReactNativeMacroScanner().scan(source: source, path: path)
+                let scanned = ObjectiveCFlutterScanner().scan(source: source, path: path)
+                facts += resolver.resolve(scanned.scannedFacts)
+                opaqueHandlerChannels += scanned.opaqueHandlerChannels
+            }
+        }
+        return (facts, opaqueHandlerChannels, unscannedEventChannels, unscannedMessageChannels)
     }
 
     /// 구문 값 그래프를 실제 컴파일러 대상과 연결해 호출별 요약을 질의한다.
@@ -868,28 +973,38 @@ public struct CartographService: Sendable {
     }
 
     public func measureMetrics(level: GraphLevel? = nil) throws -> CommandOutcome {
-        let (graph, metrics, tolerance) = metrics(in: try loadContext(), level: level)
+        let context = try loadContext()
+        let (graph, metrics, tolerance) = metrics(in: context, level: level)
         let diagnostics = AnalysisDiagnostics.diagnostics(for: metrics, thresholds: configuration.thresholds)
         let renderer = MetricsRenderer(tolerance: tolerance)
 
         let (reported, suppressed) = try filterAndApplyBaseline(diagnostics)
+        // 지표도 CI 게이트다. 임계값 아래로 깨끗한 답이 낡은 인덱스 위에서
+        // 나왔다면 그 사실이 답에 없어야 할 이유가 없다.
+        let limitations = self.limitations(context: context, graph: graph, requestedLevel: level)
 
         let summary = ReportSummary(
             command: "metrics",
             subject: describe(graph),
-            suppressedCount: suppressed
+            suppressedCount: suppressed,
+            limitations: limitations
         )
         // sarif/checkstyle/xcode/github-actions 는 진단을 담는 형식이지 지표표를 담는 형식이
         // 아니다. 예전에는 이 형식들이 지표 JSON 을 그대로 받아, 확장자만 `.sarif` 인
         // 코드 스캐닝이 거부하는 문서가 나왔다.
-        let relativeReported = reported.map { $0.relative(to: projectPath) }
+        let relativeReported = reported.map { $0.relative(toBaseVariants: PathFilter.variants(of: projectPath)) }
         let output: String = switch configuration.reportFormat {
         case .json:
-            try renderer.renderJSON(metrics, diagnostics: relativeReported, suppressedCount: suppressed)
+            try renderer.renderJSON(
+                metrics,
+                diagnostics: relativeReported,
+                suppressedCount: suppressed,
+                limitations: limitations
+            )
         case .sarif, .checkstyle, .xcode, .githubActions:
             try DiagnosticReporterFactory.make(configuration.reportFormat).report(relativeReported, summary: summary)
         case .text:
-            renderer.renderTable(metrics)
+            renderer.renderTable(metrics, limitations: limitations ?? [])
                 + (reported.isEmpty
                     ? ""
                     : "\n" + (try DiagnosticReporterFactory.make(.text).report(relativeReported, summary: summary)))
@@ -924,8 +1039,25 @@ public struct CartographService: Sendable {
             thresholdRule: AnalysisDiagnostics.Rule.layerViolation,
             // 레이어 미지정은 정보성이라 임계값 계산에 넣지 않는다.
             countedRules: [AnalysisDiagnostics.Rule.layerViolation],
+            limitations: limitations(context: context, graph: graph, requestedLevel: level),
             caveat: emptyIndexCaveat(context)
         )
+    }
+
+    /// 명령 응답에 실릴 한계 목록. 알릴 것이 없으면 nil — 빈 배열은 매번 붙는 경보다.
+    ///
+    /// 그래프를 심볼 레벨로 만든 실행은 그 그래프를 재활용한다. 그 외 레벨은
+    /// nil 을 넘기는데, 이 경우 심볼 그래프가 다시 만들어지는 것은 외부 보존
+    /// 근거를 걸어 둔 프로젝트뿐이다 — 흔한 실행에 숨은 비용을 붙이지 않는다.
+    private func limitations(
+        context: AnalysisContext, graph: CodeGraph, requestedLevel: GraphLevel?
+    ) -> [String]? {
+        let effectiveLevel = requestedLevel ?? configuration.level
+        let limitations = analysisLimitations(
+            context: context,
+            symbolGraph: effectiveLevel == .symbol ? graph : nil
+        )
+        return limitations.isEmpty ? nil : limitations
     }
 
     // MARK: - 베이스라인
@@ -1001,8 +1133,11 @@ public struct CartographService: Sendable {
         }
 
         let reporter = DiagnosticReporterFactory.make(configuration.reportFormat)
+        // 표기 펼치기는 기준 경로가 정해져 있으므로 실행당 한 번이면 충분하다.
+        // 진단마다 하면 리포트마다 수천 번의 URL 연산이 붙는다.
+        let baseVariants = PathFilter.variants(of: projectPath)
         let output = try reporter.report(
-            reported.map { $0.relative(to: projectPath) },
+            reported.map { $0.relative(toBaseVariants: baseVariants) },
             summary: ReportSummary(
                 command: command,
                 subject: subject,

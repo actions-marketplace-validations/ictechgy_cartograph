@@ -85,6 +85,16 @@ expect_status 64 "질의와 level 동시"     query Foo --level module
 expect_status 64 "값 흐름과 level 동시"  dataflow Foo --level module
 expect_status 64 "값 흐름과 since 동시"  dataflow Foo --since HEAD
 expect_status 64 "값 흐름은 JSON 전용"    dataflow Foo --report-format text
+expect_status 64 "값 흐름과 strict 동시"  dataflow Foo --strict
+expect_status 64 "질의와 형식 동시"      query Foo --report-format text
+expect_status 64 "질의와 strict 동시"    query Foo --strict
+expect_status 64 "그래프와 형식 동시"    graph --report-format json
+expect_status 64 "그래프와 strict 동시"  graph --strict
+expect_status 64 "브리지와 형식 동시"    bridges --report-format json
+expect_status 64 "브리지와 strict 동시"  bridges --strict
+expect_status 64 "베이스라인과 형식 동시" baseline --report-format json
+expect_status 64 "베이스라인과 strict 동시" baseline --strict
+expect_status 64 "설명과 테스트 전용 동시" dead --explain Foo --report-test-only
 expect_status 64 "브리지와 level 동시"   bridges --level module
 expect_status 64 "베이스라인과 level 동시" baseline --level module
 expect_status 64 "질의와 since 동시"     query Foo --since HEAD
@@ -100,7 +110,7 @@ expect_status 64 "잘못된 브리지 형식"  bridges --format yaml
 expect_status 64 "잘못된 브리지 대상"  bridges --target capacitor
 
 echo "종료 코드 2 — 도구 실패"
-MISSING="$(mktemp -d)"
+MISSING="$(mktemp -d "${TMPDIR:-/tmp}/contract.XXXXXX")"
 printf '{ not json' > "$MISSING/broken.json"
 printf '{}' > "$MISSING/badbatch.json"
 printf '["Foo"]' > "$MISSING/batch.json"
@@ -109,7 +119,8 @@ expect_status 2 "값 흐름: 인덱스 없음" dataflow Foo --project "$MISSING"
 expect_status 2 "없는 인덱스 경로"     cycles --index-store "$MISSING/nope"
 expect_status 2 "브리지: 인덱스 없음"  bridges --project "$MISSING"
 # 파일을 못 쓴 것과 순환을 찾은 것이 CI 에서 같은 신호가 되어서는 안 된다.
-expect_status 2 "출력 파일 쓰기 실패"  graph --index-store "$MISSING/nope" -o "$MISSING/no/dir/out.dot"
+# 실제 쓰기 실패는 아래 "빈 인덱스" 픽스처 다음에서 검증한다 — 없는 부모
+# 디렉터리는 -o 가 만들어 주므로 경로만으로는 실패하지 않는다.
 expect_status 2 "깨진 베이스라인"      cycles --project "$MISSING" --baseline "$MISSING/broken.json"
 # 외부 근거 파일은 지정했는데 없으면 조용히 넘어가지 않는다. 반영됐다고 믿고 지우면 앱이 깨진다.
 expect_status 2 "없는 외부 근거 파일"  dead --project "$MISSING" --external-retentions "$MISSING/none.json"
@@ -122,13 +133,24 @@ expect_status 2 "배치도 인덱스는 필요"  query --batch "$MISSING/batch.j
 # 인덱스가 열리기는 하는데 이 프로젝트를 하나도 모르는 상태. 스토어가 없는 것과 다르다.
 # 이 경우가 조용히 0 으로 끝나면 --strict 가 0 줄을 분석하고 통과한다.
 # 빌드 없이 만든다. 빈 스토어 디렉터리만 있으면 탐색은 성공하고 심볼은 0 개다.
-EMPTY="$(mktemp -d)"
-trap 'rm -rf "$MISSING" "$EMPTY"' EXIT
+EMPTY="$(mktemp -d "${TMPDIR:-/tmp}/contract.XXXXXX")"
 mkdir -p "$EMPTY/.build/index/store" "$EMPTY/Sources"
 printf 'struct A {\n    func b() {}\n}\n' > "$EMPTY/Sources/A.swift"
 expect_status 2 "빈 인덱스"            dead   --strict --project "$EMPTY"
 expect_status 2 "빈 인덱스: cycles"    cycles --strict --project "$EMPTY"
 expect_status 2 "빈 인덱스: rules"     rules  --strict --project "$EMPTY"
+# 목적지를 디렉터리로 준다. 파일로 못 쓰는 자리이므로 이 실패는 진짜 쓰기 실패다.
+expect_status 2 "출력 파일 쓰기 실패"  graph --project "$EMPTY" --allow-empty-index -o "$EMPTY"
+
+# 설정 파일의 baseline_path 는 읽기 위치일 뿐, 쓰기 목적지가 아니다. 분석 대상
+# 저장소의 설정에 절대 경로를 심어 두고 baseline 을 돌리면 그 파일이 덮여써졌다.
+CFG="$(mktemp -d "${TMPDIR:-/tmp}/contract.XXXXXX")"
+trap 'rm -rf "$MISSING" "$EMPTY" "$CFG"' EXIT
+printf 'baseline_path: /tmp/cartograph-hostile-baseline.json\n' > "$CFG/.cartograph.yml"
+expect_status 64 "설정의 baseline_path 로는 쓰지 않는다" \
+    baseline --project "$CFG" --index-store "$EMPTY/.build/index/store" --allow-empty-index
+expect_status 0 "쓰기 목적지를 명시하면 기록한다" \
+    baseline --project "$EMPTY" --allow-empty-index --write "$EMPTY/baseline.json"
 
 echo "종료 코드 0 — 빈 인덱스 탈출구"
 expect_status 0 "빈 인덱스 허용"       dead --strict --project "$EMPTY" --allow-empty-index

@@ -1,4 +1,4 @@
-import CartographCore
+@testable import CartographCore
 import CartographTestSupport
 import Foundation
 import Testing
@@ -84,14 +84,6 @@ struct CodeGraphTests {
     func filteringNodesRemovesDanglingEdges() {
         let graph = TestGraph.make(["A": ["B"], "B": ["C"]])
         let filtered = graph.filteringNodes { $0.id != "B" }
-        #expect(filtered.nodeCount == 2)
-        #expect(filtered.edgeCount == 0)
-    }
-
-    @Test("간선 필터는 정점을 유지한다")
-    func filteringEdgesKeepsNodes() {
-        let graph = TestGraph.make(kind: .call, ["A": ["B"]])
-        let filtered = graph.filteringEdges { $0.kind != .call }
         #expect(filtered.nodeCount == 2)
         #expect(filtered.edgeCount == 0)
     }

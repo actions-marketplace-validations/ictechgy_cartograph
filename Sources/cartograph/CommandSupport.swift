@@ -80,13 +80,16 @@ enum CommandSupport {
         // 없는 이름을 물어본 것은 코드의 문제가 아니라 인자의 문제다. 사용 오류로
         // 끝내야 CI 스크립트의 오타가 드러난다. 설명은 이미 출력한 뒤다.
         if outcome.subjectNotFound {
-            // 배치에서는 어느 이름이 없었는지 말한다. 불리언 하나만 던지면 1000건 중
-            // 셋이 없었을 때 사용자가 JSON 을 다시 훑어야 한다. 답은 이미 다 나갔다.
+            // 단일 경로는 이름과 비슷한 이름 추천을 담은 문구를 준비해 온다.
             guard !outcome.missingSubjects.isEmpty else {
-                throw ValidationError("no declaration matches the requested name")
+                throw ValidationError(
+                    outcome.notFoundMessage ?? "no declaration matches the requested name"
+                )
             }
             let shown = outcome.missingSubjects.prefix(10).joined(separator: ", ")
             let rest = outcome.missingSubjects.count - min(10, outcome.missingSubjects.count)
+            // 배치에서는 어느 이름이 없었는지 말한다. 불리언 하나만 던지면 1000건 중
+            // 셋이 없었을 때 사용자가 JSON 을 다시 훑어야 한다. 답은 이미 다 나갔다.
             throw ValidationError(
                 "no declaration matches \(outcome.missingSubjects.count) of the requested names: "
                     + shown + (rest > 0 ? " and \(rest) more" : "")
@@ -108,5 +111,30 @@ enum CommandSupport {
     /// 사용자에게 보여 줄 오류 메시지로 바꾼다.
     static func describe(_ error: any Error) -> String {
         (error as? CartographError)?.errorDescription ?? "\(error)"
+    }
+}
+
+/// 정해진 자리에 템플릿 파일을 깐다.
+///
+/// `skill` 과 `init` 이 절차를 따로 두면 존재 확인 문구와 오류 감싸기가 두
+/// 벌로 갈라진다 — 실제로 그랬다. 새 하위 명령이 템플릿을 깔 일이 생기면
+/// 여기 하나만 고쳐진다.
+enum TemplateInstaller {
+    /// 내용을 쓰고 안내 줄을 출력한다. 덮어쓰기는 `--force` 를 요구한다.
+    static func install(
+        _ content: String,
+        to path: String,
+        force: Bool,
+        fileSystem: any FileSystem
+    ) throws {
+        guard force || !fileSystem.fileExists(at: path) else {
+            throw ValidationError("\(path) already exists. Pass --force to overwrite it.")
+        }
+        do {
+            try fileSystem.write(text: content, to: path)
+        } catch {
+            throw CartographError.outputUnwritable(path: path, underlying: "\(error)")
+        }
+        print("Wrote \(path)")
     }
 }

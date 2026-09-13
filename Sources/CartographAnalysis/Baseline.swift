@@ -40,11 +40,6 @@ public struct Baseline: Sendable, Codable, Equatable {
     public static func capturing(_ diagnostics: [Diagnostic]) -> Baseline {
         Baseline(fingerprints: diagnostics.map(\.fingerprint))
     }
-
-    /// 두 베이스라인을 합친다. 점진적으로 범위를 넓힐 때 쓴다.
-    public func merging(_ other: Baseline) -> Baseline {
-        Baseline(fingerprints: fingerprints + other.fingerprints)
-    }
 }
 
 /// 베이스라인 파일 입출력.
