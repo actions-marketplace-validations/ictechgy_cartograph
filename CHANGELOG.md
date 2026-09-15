@@ -7,6 +7,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-15
+
+### Added
+
+- Query neighbors now include bounded reference-site evidence with actual edge endpoints, minimum-depth
+  intermediates, and explicit compiler/syntax/inferred/unknown provenance.
+- Query responses identify unrefined local functions by name, location, owner, reason, and suggested
+  action, including ambiguous and not-found results. Evidence and diagnostics expose omitted counts.
+- Analysis snapshots preserve reference provenance and detailed local-function diagnostics across rebasing;
+  older snapshots retain unknown provenance instead of being upgraded to compiler evidence.
+- MCP query batches share optional-evidence budgets across the response, preserving all requested results
+  and accurate omission counts without repeating large evidence lists for every symbol.
+- The macOS release archive includes the query evidence contract linked from its README.
+
+### Fixed
+
+- Recover named local-function consumers from fresh, unambiguous source/index evidence, preserving
+  actual transitive caller depth and existing nonlocal reachability and graph rollups. Report the
+  observed unresolved local-function count when compiler projection must remain conservative.
+- Preserve a used conformance typealias when the compiler supplies an implicit base relationship at
+  the same source coordinate; avoid nearest-type guesses that could create false dependencies.
+- Stop treating receiver types as callers in dependency and change-impact queries.
+- Distinguish concrete witness use from protocol requirement use while preserving requirement
+  refinement, default implementations, class overrides, and contracts outside the selected graph.
+- Refine broad index dispatch roles only with exact, unambiguous source evidence. Explicit runtime
+  dispatch and unknown macro/source contexts remain conservative.
+- Preserve implicit public access on protocol requirements, explicit-access extension members,
+  and enum cases so library APIs are not misreported under `--retain-public`.
+- Report unused helpers in external-type extensions even when the extension itself is not a
+  reportable type; keep grouping members under genuinely unused local types.
+- Wait for Xcode path discovery through process termination notification instead of run-loop polling,
+  preserving unsuccessful-exit handling while reducing repeated session preparation overhead.
+
 ## [0.13.0] - 2026-09-14
 
 ### Added
@@ -933,7 +966,8 @@ First release.
 - macOS only in practice: the index store format and `libIndexStore` discovery are Apple-toolchain
   specific.
 
-[Unreleased]: https://github.com/ictechgy/cartograph/compare/0.13.0...HEAD
+[Unreleased]: https://github.com/ictechgy/cartograph/compare/0.14.0...HEAD
+[0.14.0]: https://github.com/ictechgy/cartograph/compare/0.13.0...0.14.0
 [0.13.0]: https://github.com/ictechgy/cartograph/compare/0.12.0...0.13.0
 [0.12.0]: https://github.com/ictechgy/cartograph/compare/0.11.0...0.12.0
 [0.11.0]: https://github.com/ictechgy/cartograph/compare/0.10.1...0.11.0
