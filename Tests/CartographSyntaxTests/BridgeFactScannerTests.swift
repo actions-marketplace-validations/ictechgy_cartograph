@@ -187,6 +187,27 @@ struct BridgeFactScannerTests {
         #expect(facts(source, of: .channelRegister).allSatisfy { $0.isDynamic })
     }
 
+    @Test("많은 핸들러의 범위는 사실마다 복사하지 않고 선언별로 보존한다")
+    func storesHandlerScopesOncePerDeclaration() {
+        let registrations = (0..<100).map { index in
+            "let channel\(index) = BasicMessageChannel<Any?>(name: \"channel\(index)\", binaryMessenger: messenger)\n"
+                + "channel\(index).setMessageHandler { _, _ in reply(\(index)) }"
+        }.joined(separator: "\n")
+        let split = registrations.split(separator: "\n", omittingEmptySubsequences: true)
+        let first = split.prefix(100)
+        let second = split.dropFirst(100)
+        let result = BridgeFactScanner().scan(
+            source: "func install() {\n\(first.joined(separator: "\n"))\n}\n"
+                + "func installSecond() {\n\(second.joined(separator: "\n"))\n}",
+            path: "/p/Plugin.swift", messages: true
+        )
+
+        #expect(result.facts.count == 100)
+        #expect(result.handlerScopes.count == 2)
+        #expect(result.handlerScopes.map(\.scopes.count) == [50, 50])
+        #expect(result.facts.allSatisfy { $0.handlerScopes.isEmpty })
+    }
+
     @Test("채널을 만들기만 한 것은 사실이 아니다")
     func creationAloneIsNotAFact() {
         let source = """
@@ -875,6 +896,99 @@ struct BridgeFactScannerTests {
         #expect(result.facts.isEmpty)
         #expect(result.unscannedEventChannels == 1)
         #expect(result.unscannedMessageChannels == 1)
+    }
+
+    @Test("messages 선택은 BasicMessageChannel의 non-nil 핸들러만 message-handle로 낸다")
+    func recordsBasicMessageHandlersOnlyWhenOptedIn() {
+        let source = """
+            let name = "wrong"
+            let basic = FlutterBasicMessageChannel<Any?>(name: "literal", binaryMessenger: m)
+            let alias = basic
+            alias.setMessageHandler { _, _ in }
+            basic.setMessageHandler(nil)
+            other.setMessageHandler { _, _ in }
+            FlutterMethodChannel(name: name, binaryMessenger: m).setMethodCallHandler { _, _ in }
+            """
+        let result = BridgeFactScanner().scan(source: source, path: "/p/A.swift", messages: true)
+        // 수신자를 못 푸는 `other` 도 사실로 남긴다. 버리면 클로저 범위가 목록에서
+        // 빠져 그 안의 참조가 다른 핸들러의 공통 등록 근거로 오염된다.
+        #expect(result.facts.map(\.fact.kind) == [.messageHandle, .messageHandle])
+        #expect(result.facts.map(\.fact.channel) == ["literal", "other"])
+        #expect(result.facts.last?.fact.isDynamic == true)
+        #expect(result.facts.first?.fact.method == nil)
+        #expect(result.unscannedMessageChannels == 1)
+    }
+
+    @Test("수신자가 파라미터·필드라도 setMessageHandler 는 동적 이름의 사실과 범위를 남긴다")
+    func unresolvedMessageReceiverKeepsFactAndScope() {
+        let source = """
+            func install(channel: BasicMessageChannel<Any?>) {
+                channel.setMessageHandler { _, _ in }
+            }
+            """
+        let result = BridgeFactScanner().scan(source: source, path: "/p/A.swift", messages: true)
+        #expect(result.facts.map(\.fact.kind) == [.messageHandle])
+        #expect(result.facts.first?.fact.channel == "channel")
+        #expect(result.facts.first?.fact.isDynamic == true)
+        #expect(result.facts.first?.fact.handlerScope != nil)
+        #expect(result.handlerScopes.first?.scopes.count == 1)
+    }
+
+    @Test("메시지·이벤트 채널은 메서드 핸들러의 단일 채널 추측을 오염시키지 않는다")
+    func otherChannelKindsDoNotContaminateMethodInference() {
+        let source = """
+            let basic = BasicMessageChannel<Any?>(name: "pigeon", binaryMessenger: m)
+            let events = FlutterEventChannel(name: "stream", binaryMessenger: m)
+            let channel = FlutterMethodChannel(name: "method", binaryMessenger: m)
+            func handle(_ call: FlutterMethodCall, result: FlutterResult) {
+                switch call.method {
+                case "ping": result("pong")
+                default: break
+                }
+            }
+            """
+        let result = BridgeFactScanner().scan(source: source, path: "/p/A.swift")
+        let handled = result.facts.first { $0.fact.kind == .methodHandle }?.fact
+        #expect(handled?.channel == "method")
+        #expect(handled?.isChannelInferred == true)
+    }
+
+    @Test("qualified generic BasicMessageChannel과 읽기 전용 문자열 별칭을 해석한다")
+    func resolvesQualifiedGenericMessageChannels() {
+        let source = """
+            let prefix = "dev.flutter.pigeon.CameraApi.method"
+            let name = prefix
+            let channel = Flutter.FlutterBasicMessageChannel<Any?, Any?>(name: name, binaryMessenger: m)
+            channel.setMessageHandler { _, _ in }
+            """
+        let fact = BridgeFactScanner().scan(source: source, path: "/p/A.swift", messages: true).facts.first?.fact
+        #expect(fact?.kind == .messageHandle)
+        #expect(fact?.isDynamic == false)
+        #expect(fact?.channel == "dev.flutter.pigeon.CameraApi.method")
+    }
+
+    @Test("보간 채널은 원문과 디코드한 선행 리터럴을 함께 보존한다")
+    func preservesInterpolatedMessagePrefix() {
+        let source = #"""
+            let c = BasicMessageChannel<Any?>(name: "dev.flutter.pigeon.\u{1F4F7}\(suffix)", binaryMessenger: m)
+            c.setMessageHandler { _, _ in }
+            """#
+        let fact = BridgeFactScanner().scan(source: source, path: "/p/A.swift", messages: true).facts.first?.fact
+        #expect(fact?.isDynamic == true)
+        #expect(fact?.channel == #""dev.flutter.pigeon.\u{1F4F7}\(suffix)""#)
+        #expect(fact?.channelPrefix == "dev.flutter.pigeon.📷")
+    }
+
+    @Test("BasicMessageChannel 메서드 참조는 closure 범위 근거 없이 fallback한다")
+    func messageMethodReferenceHasNoClosureScope() {
+        let source = """
+            let c = BasicMessageChannel<Any?>(name: "c", binaryMessenger: m)
+            c.setMessageHandler(handler)
+            """
+        let fact = BridgeFactScanner().scan(source: source, path: "/p/A.swift", messages: true).facts.first?.fact
+        #expect(fact?.kind == .messageHandle)
+        #expect(fact?.handlerScope == nil)
+        #expect(fact?.dependencies == nil)
     }
 
     @Test("call.method 가 아닌 switch 는 건드리지 않는다")

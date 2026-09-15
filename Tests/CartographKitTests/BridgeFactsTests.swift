@@ -7,6 +7,390 @@ import Testing
 
 @Suite("브리지 사실 문서")
 struct BridgeFactsTests {
+    @Test("실제 구문으로 얻은 1000 handler가 자기 참조만 보존한다")
+    func classifiesLargeSharedSetupWithoutCrossContamination() {
+        let registrations = (0..<1000).map { index in
+            "let c\(index) = FlutterBasicMessageChannel(name: \"c\(index)\", binaryMessenger: messenger)\n"
+                + "c\(index).setMessageHandler { _, _ in helper() }"
+        }.joined(separator: "\n")
+        let scanned = BridgeFactScanner().scan(
+            source: "func install() {\n\(registrations)\n}\nfunc helper() {}\n",
+            path: "/tmp/large.swift", messages: true
+        )
+        let declaration = scanned.handlerScopes[0].declaration
+        let scopes = scanned.handlerScopes[0].scopes
+        let snapshot = IndexSnapshot(symbols: [
+            IndexedSymbol(usr: "s:setup", name: "install()", kind: .function, module: "P",
+                location: .init(path: "/tmp/large.swift", line: 1, column: 6)),
+            IndexedSymbol(usr: "s:helper", name: "helper()", kind: .function, module: "P",
+                location: .init(path: "/tmp/large.swift", line: declaration.end!.line + 1, column: 6)),
+        ], references: scopes.map { scope in
+            IndexedReference(sourceUSR: "s:setup", targetUSR: "s:helper", kind: .call,
+                location: .init(path: scope.end.path, line: scope.end.line, column: scope.end.column - 9))
+        })
+        let result = BridgeSymbolResolver(snapshot: snapshot, freshPaths: ["/tmp/large.swift"])
+            .resolve(scanned.facts, handlerScopes: scanned.handlerScopes)
+        #expect(result.count == 1000)
+        #expect(result.allSatisfy { $0.handlerScope?.complete == true && $0.dependencies?.count == 1 })
+        #expect(result.allSatisfy { $0.dependencies?.first?.scope == .handler })
+        #expect(Set(result.compactMap { $0.dependencies?.first?.location }).count == 1000)
+    }
+
+    @Test("감싸는 선언이 없는 Basic callback도 소비 가능한 불완전 근거를 낸다")
+    func topLevelMessageKeepsPairedExecutionEvidence() {
+        let scanned = BridgeFactScanner().scan(source: """
+            let channel = FlutterBasicMessageChannel(name: "top", binaryMessenger: messenger)
+            channel.setMessageHandler { _, reply in reply(nil) }
+            """, path: "/tmp/main.swift", messages: true)
+        let facts = BridgeSymbolResolver(snapshot: IndexSnapshot()).resolve(
+            scanned.facts, handlerScopes: scanned.handlerScopes
+        )
+        #expect(facts.count == 1)
+        #expect(facts.first?.handlerScope?.complete == false)
+        #expect(facts.first?.dependencies?.isEmpty == true)
+    }
+
+    @Test("두 번째 handler 시작 위치의 참조가 다른 handler의 등록 의존으로 새지 않는다")
+    func referenceAtHandlerStartStaysInThatHandler() {
+        let fixture = scopedFixture(referenceLines: [10], referenceColumn: 10)
+        let result = fixture.resolver.resolve(fixture.facts, handlerScopes: fixture.scopes)
+        #expect(result[0].dependencies?.isEmpty == true)
+        #expect(result[1].dependencies?.map(\.scope) == [.handler])
+        #expect(result.allSatisfy { $0.handlerScope?.complete == true })
+    }
+
+    @Test("생성 예산은 dispatch 비용과 다음 파일에 걸쳐 유지되고 부분 근거를 알린다")
+    func generationBudgetIncludesDispatchAndSubsequentFiles() {
+        let fixture = scopedFixture(referenceLines: [4, 10], referenceColumn: 11)
+        var budget = 3
+        let result = fixture.resolver.resolve(fixture.facts, handlerScopes: fixture.scopes, dependencyBudget: &budget)
+        #expect(result[0].dependencies?.count == 1)
+        #expect(result[0].dependencies?.first?.dispatchTargets.count == 1)
+        #expect(result[0].handlerScope?.complete == true)
+        #expect(result[1].dependencies?.isEmpty == true)
+        #expect(result[1].handlerScope?.complete == false)
+        #expect(budget == 1)
+        let next = fixture.resolver.resolve(fixture.facts, handlerScopes: fixture.scopes, dependencyBudget: &budget)
+        #expect(next.allSatisfy { $0.dependencies?.isEmpty == true && $0.handlerScope?.complete == false })
+        let document = BridgeFactsDocument(
+            tool: .init(name: "cartograph", version: "test"), generatedAt: "2026-09-14T00:00:00Z",
+            project: "/", facts: result, version: 2, transport: "basic-message-channel"
+        )
+        #expect(document.limitations.contains { $0.hasPrefix("incomplete-message-handler-scopes:") })
+    }
+
+    @Test("handler 목록이 없거나 일부만 전달되면 완전하다고 보고하지 않는다", arguments: [false, true])
+    func missingScopeInventoryPreservesUncertainty(partial: Bool) {
+        let fixture = scopedFixture(referenceLines: [4, 10], referenceColumn: 11)
+        let inventory = partial ? [ScannedBridgeHandlerScopes(
+            declaration: fixture.scopes[0].declaration, scopes: [fixture.scopes[0].scopes[0]]
+        )] : []
+        let result = fixture.resolver.resolve(fixture.facts, handlerScopes: inventory)
+        #expect(result.allSatisfy { $0.handlerScope?.complete == false })
+        #expect(result.allSatisfy { $0.dependencies?.count == 1 })
+        #expect(result.allSatisfy { $0.dependencies?.first?.scope == .handler })
+        let document = BridgeFactsDocument(
+            tool: .init(name: "cartograph", version: "test"), generatedAt: "2026-09-14T00:00:00Z",
+            project: "/", facts: result, version: 2, transport: "basic-message-channel"
+        )
+        #expect(document.limitations.contains { $0.hasPrefix("incomplete-message-handler-scopes: 2 ") })
+    }
+
+    @Test("같은 선언과 handler의 경로 별칭 목록은 중복 없이 같은 의존성을 낸다")
+    func duplicateCanonicalScopeInventoryIsMerged() {
+        let fixture = scopedFixture(referenceLines: [4, 10], referenceColumn: 11)
+        let declaration = EnclosingDeclaration(
+            name: "install", indexName: "install()", qualifiedName: "P.install", line: 1,
+            start: .init(path: "/private/tmp", line: 1, column: 1),
+            end: .init(path: "/private/tmp", line: 20, column: 1)
+        )
+        let aliases = fixture.scopes[0].scopes.map { scope in BridgeFact.HandlerScope(
+            start: .init(path: "/private/tmp", line: scope.start.line, column: scope.start.column),
+            end: .init(path: "/private/tmp", line: scope.end.line, column: scope.end.column), complete: false
+        ) }
+        let inventory = fixture.scopes + [ScannedBridgeHandlerScopes(declaration: declaration, scopes: aliases)]
+        let result = fixture.resolver.resolve(fixture.facts, handlerScopes: inventory)
+        #expect(result == fixture.resolver.resolve(fixture.facts, handlerScopes: fixture.scopes))
+        #expect(result.allSatisfy { $0.handlerScope?.complete == true })
+        #expect(result.allSatisfy { $0.dependencies?.count == 1 && $0.dependencies?.first?.scope == .handler })
+    }
+
+    @Test("클로저 캡처 초기화식의 참조는 핸들러가 아니라 등록 근거다")
+    func captureListInitializerIsRegistrationEvidence() {
+        let scanned = BridgeFactScanner().scan(source: """
+            func install() {
+                let c = BasicMessageChannel<Any?>(name: "c", binaryMessenger: m)
+                c.setMessageHandler { [s = make()] _, _ in
+                    s.run()
+                }
+            }
+            """, path: "/tmp/c.swift", messages: true)
+        guard let scope = scanned.facts.first?.fact.handlerScope else {
+            Issue.record("handlerScope가 없다")
+            return
+        }
+        // 캡처의 `make()` 는 `{` 와 `in` 사이, 본문의 `s.run()` 은 `in` 뒤다.
+        let snapshot = IndexSnapshot(symbols: [
+            IndexedSymbol(usr: "s:install", name: "install()", kind: .function, module: "P",
+                location: .init(path: "/tmp/c.swift", line: 1, column: 6)),
+            IndexedSymbol(usr: "s:make", name: "make()", kind: .function, module: "P",
+                location: .init(path: "/tmp/c.swift", line: 8, column: 6)),
+            IndexedSymbol(usr: "s:run", name: "run()", kind: .method, module: "P",
+                location: .init(path: "/tmp/c.swift", line: 9, column: 6)),
+        ], references: [
+            IndexedReference(sourceUSR: "s:install", targetUSR: "s:make", kind: .call,
+                location: .init(path: "/tmp/c.swift", line: scope.start.line, column: scope.start.column - 3)),
+            IndexedReference(sourceUSR: "s:install", targetUSR: "s:run", kind: .call,
+                location: .init(path: "/tmp/c.swift", line: scope.start.line + 1, column: 5)),
+        ])
+        let result = BridgeSymbolResolver(snapshot: snapshot, freshPaths: ["/tmp/c.swift"])
+            .resolve(scanned.facts, handlerScopes: scanned.handlerScopes)
+        #expect(result.first?.handlerScope?.complete == true)
+        #expect(result.first?.dependencies?.map(\.scope) == [.registration, .handler])
+    }
+
+    @Test("같은 라벨의 후보가 같은 거리에 여럿이면 USR을 추측하지 않는다")
+    func equidistantLabelMatchesStayNameOnly() {
+        let scope = BridgeFact.HandlerScope(
+            start: .init(path: "/tmp/a.swift", line: 10, column: 10),
+            end: .init(path: "/tmp/a.swift", line: 12, column: 1), complete: false
+        )
+        let declaration = EnclosingDeclaration(
+            name: "install", indexName: "install()", qualifiedName: "P.install", line: 5,
+            start: .init(path: "/tmp/a.swift", line: 5, column: 1),
+            end: .init(path: "/tmp/a.swift", line: 15, column: 1)
+        )
+        let fact = BridgeFact(
+            kind: .messageHandle, target: .flutter, channel: "c", handlerScope: scope,
+            location: .init(path: "/tmp/a.swift", line: 10, column: 5)
+        )
+        // 선언 줄(5)에서 거리가 4로 같은 두 후보 — 어느 쪽의 USR도 근거로 단정할 수 없다.
+        let snapshot = IndexSnapshot(symbols: [
+            IndexedSymbol(usr: "s:a", name: "install()", kind: .function, module: "P",
+                location: .init(path: "/tmp/a.swift", line: 1, column: 1)),
+            IndexedSymbol(usr: "s:b", name: "install()", kind: .function, module: "P",
+                location: .init(path: "/tmp/a.swift", line: 9, column: 1)),
+        ])
+        let result = BridgeSymbolResolver(snapshot: snapshot, freshPaths: ["/tmp/a.swift"])
+            .resolve([ScannedBridgeFact(fact: fact, declaration: declaration, handlerScopes: [scope])])
+        #expect(result.first?.symbol?.usr == nil)
+        #expect(result.first?.symbol?.qualifiedName == "P.install")
+        #expect(result.first?.handlerScope?.complete == false)
+    }
+
+    @Test("외부 요구사항에 프로젝트 내 구현이 있으면 실행 근거를 완전하다고 보고하지 않는다")
+    func externalRequirementWithInternalOverridesIsIncomplete() {
+        let scope = BridgeFact.HandlerScope(
+            start: .init(path: "/tmp/e.swift", line: 4, column: 10),
+            end: .init(path: "/tmp/e.swift", line: 6, column: 1), complete: false
+        )
+        let declaration = EnclosingDeclaration(
+            name: "install", indexName: "install()", qualifiedName: "P.install", line: 2,
+            start: .init(path: "/tmp/e.swift", line: 2, column: 1),
+            end: .init(path: "/tmp/e.swift", line: 8, column: 1)
+        )
+        let fact = BridgeFact(
+            kind: .messageHandle, target: .flutter, channel: "c", handlerScope: scope,
+            location: .init(path: "/tmp/e.swift", line: 4, column: 5)
+        )
+        let snapshot = IndexSnapshot(symbols: [
+            IndexedSymbol(usr: "s:setup", name: "install()", kind: .function, module: "P",
+                location: .init(path: "/tmp/e.swift", line: 2, column: 1)),
+            IndexedSymbol(usr: "s:ext", name: "requirement()", kind: .method, module: "Lib",
+                location: .init(path: "/sdk/Lib.swiftinterface", line: 3, column: 1), isExternal: true),
+            IndexedSymbol(usr: "s:impl", name: "requirement()", kind: .method, module: "P",
+                location: .init(path: "/tmp/e.swift", line: 20, column: 1)),
+        ], references: [
+            IndexedReference(sourceUSR: "s:setup", targetUSR: "s:ext", kind: .call,
+                location: .init(path: "/tmp/e.swift", line: 5, column: 5)),
+            IndexedReference(sourceUSR: "s:impl", targetUSR: "s:ext", kind: .overrides),
+        ])
+        let result = BridgeSymbolResolver(snapshot: snapshot, freshPaths: ["/tmp/e.swift"])
+            .resolve([ScannedBridgeFact(fact: fact, declaration: declaration, handlerScopes: [scope])])
+        #expect(result.first?.handlerScope?.complete == false)
+        #expect(result.first?.dependencies?.isEmpty == true)
+    }
+
+    @Test("범위는 있는데 의존성 배열이 없는 사실은 완전하다고 나가지 않는다")
+    func scopeWithoutDependenciesIsNotEmittedComplete() {
+        let scope = BridgeFact.HandlerScope(
+            start: .init(path: "/tmp/d.swift", line: 4, column: 10),
+            end: .init(path: "/tmp/d.swift", line: 6, column: 1), complete: true
+        )
+        let fact = BridgeFact(
+            kind: .messageHandle, target: .flutter, channel: "c", handlerScope: scope,
+            dependencies: nil, location: .init(path: "/tmp/d.swift", line: 4, column: 5)
+        )
+        let document = BridgeFactsDocument(
+            tool: .init(name: "cartograph", version: "test"), generatedAt: "2026-09-14T00:00:00Z",
+            project: "/", facts: [fact], version: 2, transport: "basic-message-channel"
+        )
+        #expect(document.facts.first?.handlerScope?.complete == false)
+        #expect(document.facts.first?.dependencies == [])
+        #expect(document.limitations.contains { $0.hasPrefix("incomplete-message-handler-scopes:") })
+    }
+
+    @Test("최상위 등록은 파일의 가상 최상위 심볼을 소유자로 단다")
+    func topLevelMessageAttachesVirtualTopLevelSymbol() {
+        let scanned = BridgeFactScanner().scan(source: """
+            let channel = FlutterBasicMessageChannel(name: "top", binaryMessenger: messenger)
+            channel.setMessageHandler { _, reply in reply(nil) }
+            """, path: "/tmp/main.swift", messages: true)
+        let topLevelUSR = "cartograph:top-level-code:/tmp/main.swift"
+        let snapshot = IndexSnapshot(symbols: [
+            IndexedSymbol(usr: topLevelUSR, name: "top-level code", kind: .function, module: "P",
+                location: .init(path: "/tmp/main.swift", line: 1, column: 1))
+        ])
+        let facts = BridgeSymbolResolver(snapshot: snapshot).resolve(
+            scanned.facts, handlerScopes: scanned.handlerScopes
+        )
+        #expect(facts.first?.symbol?.usr == topLevelUSR)
+        #expect(facts.first?.symbol?.qualifiedName == "P.top-level code")
+        #expect(facts.first?.handlerScope?.complete == false)
+    }
+
+    private func scopedFixture(referenceLines: [Int], referenceColumn: Int) -> (
+        resolver: BridgeSymbolResolver, facts: [ScannedBridgeFact], scopes: [ScannedBridgeHandlerScopes]
+    ) {
+        let declaration = EnclosingDeclaration(
+            name: "install", indexName: "install()", qualifiedName: "P.install", line: 1,
+            start: .init(path: "/tmp", line: 1, column: 1), end: .init(path: "/tmp", line: 20, column: 1)
+        )
+        let scopes = [4, 10].map { line in BridgeFact.HandlerScope(
+            start: .init(path: "/tmp", line: line, column: 10),
+            end: .init(path: "/tmp", line: line + 2, column: 1), complete: false
+        ) }
+        let facts = scopes.enumerated().map { index, scope in ScannedBridgeFact(
+            fact: BridgeFact(kind: .messageHandle, target: .flutter, channel: "channel\(index)",
+                handlerScope: scope, location: scope.start), declaration: declaration
+        ) }
+        let snapshot = IndexSnapshot(symbols: [
+            IndexedSymbol(usr: "s:setup", name: "install()", kind: .function, module: "P",
+                location: .init(path: "/tmp", line: 1, column: 1)),
+            IndexedSymbol(usr: "s:helper", name: "helper()", kind: .function, module: "P",
+                location: .init(path: "/tmp", line: 22, column: 1)),
+            IndexedSymbol(usr: "s:implementation", name: "helper()", kind: .function, module: "Q",
+                location: .init(path: "/tmp", line: 24, column: 1)),
+        ], references: referenceLines.map { line in
+            IndexedReference(sourceUSR: "s:setup", targetUSR: "s:helper", kind: .call,
+                location: .init(path: "/tmp", line: line, column: referenceColumn))
+        } + [IndexedReference(sourceUSR: "s:implementation", targetUSR: "s:helper", kind: .overrides)])
+        return (BridgeSymbolResolver(snapshot: snapshot, freshPaths: ["/tmp"]), facts,
+            [ScannedBridgeHandlerScopes(declaration: declaration, scopes: scopes)])
+    }
+
+    @Test("브리지 의존성 범위는 같은 파일의 tmp 표기 차이에도 line/column으로 맞춘다")
+    func executionDependencyRangeIgnoresPathSpelling() throws {
+        let scope = BridgeFact.HandlerScope(
+            start: .init(path: "/private/tmp", line: 4, column: 20),
+            end: .init(path: "/private/tmp", line: 6, column: 5), complete: false
+        )
+        let fact = BridgeFact(
+            kind: .messageHandle, target: .flutter, channel: "c", handlerScope: scope,
+            location: .init(path: "/private/tmp", line: 4, column: 1)
+        )
+        let declaration = EnclosingDeclaration(
+            name: "install", indexName: "install()", qualifiedName: "P.install", line: 2,
+            start: .init(path: "/private/tmp", line: 2, column: 1),
+            end: .init(path: "/private/tmp", line: 8, column: 1)
+        )
+        let target = IndexedSymbol(
+            usr: "s:target", name: "helper()", kind: .function, module: "App",
+            location: .init(path: "/tmp", line: 20, column: 1)
+        )
+        let duplicateTarget = IndexedSymbol(
+            usr: "s:target", name: "helper()", kind: .function, module: "App",
+            location: .init(path: "/tmp", line: 20, column: 1)
+        )
+        let snapshot = IndexSnapshot(
+            symbols: [IndexedSymbol(
+                usr: "s:setup", name: "install()", kind: .function, module: "App",
+                location: .init(path: "/tmp", line: 2, column: 1)
+            ), target, duplicateTarget],
+            references: [IndexedReference(
+                sourceUSR: "s:setup", targetUSR: "s:target", kind: .call,
+                location: .init(path: "/tmp", line: 5, column: 30)
+            )]
+        )
+        let resolved = BridgeSymbolResolver(
+            snapshot: snapshot, freshPaths: ["/private/tmp"]
+        ).resolve([ScannedBridgeFact(fact: fact, declaration: declaration, handlerScopes: [scope])]).first
+        #expect(resolved?.handlerScope?.complete == true)
+        #expect(resolved?.dependencies?.count == 1)
+        #expect(resolved?.dependencies?.first?.scope == .handler)
+        #expect(resolved?.dependencies?.first?.location.path == "/tmp")
+    }
+
+    @Test("위치 없는 내부 미해석 참조는 실행 근거를 불완전하게 만든다")
+    func unknownUnlocatedReferenceMakesExecutionEvidenceIncomplete() {
+        let scope = BridgeFact.HandlerScope(
+            start: .init(path: "/tmp", line: 4, column: 20),
+            end: .init(path: "/tmp", line: 5, column: 5), complete: false
+        )
+        let declaration = EnclosingDeclaration(
+            name: "install", indexName: "install()", qualifiedName: "P.install", line: 2,
+            start: .init(path: "/tmp", line: 2, column: 1), end: .init(path: "/tmp", line: 8, column: 1)
+        )
+        let fact = BridgeFact(
+            kind: .messageHandle, target: .flutter, channel: "c", handlerScope: scope,
+            location: .init(path: "/tmp", line: 4, column: 1)
+        )
+        let snapshot = IndexSnapshot(
+            symbols: [IndexedSymbol(
+                usr: "s:setup", name: "install()", kind: .function, module: "App",
+                location: .init(path: "/tmp", line: 2, column: 1)
+            )],
+            references: [IndexedReference(
+                sourceUSR: "s:setup", targetUSR: "s:missing", kind: .call, location: nil
+            )]
+        )
+
+        let resolved = BridgeSymbolResolver(snapshot: snapshot, freshPaths: ["/tmp"])
+            .resolve([ScannedBridgeFact(fact: fact, declaration: declaration)]).first
+        #expect(resolved?.handlerScope?.complete == false)
+        #expect(resolved?.dependencies?.isEmpty == true)
+    }
+
+    @Test("같은 setup의 method reference는 다른 inline closure를 complete로 만들지 않는다")
+    func unscopedHandlerMakesExecutionEvidenceIncomplete() {
+        let scope = BridgeFact.HandlerScope(
+            start: .init(path: "/tmp", line: 4, column: 20),
+            end: .init(path: "/tmp", line: 5, column: 5), complete: false
+        )
+        let declaration = EnclosingDeclaration(
+            name: "install", indexName: "install()", qualifiedName: "P.install", line: 2,
+            start: .init(path: "/tmp", line: 2, column: 1),
+            end: .init(path: "/tmp", line: 8, column: 1)
+        )
+        let inline = BridgeFact(
+            kind: .messageHandle, target: .flutter, channel: "one", handlerScope: scope,
+            location: .init(path: "/tmp", line: 4, column: 1)
+        )
+        let methodReference = BridgeFact(
+            kind: .messageHandle, target: .flutter, channel: "two",
+            location: .init(path: "/tmp", line: 6, column: 1)
+        )
+        let setup = IndexedSymbol(
+            usr: "s:setup", name: "install()", kind: .function, module: "App",
+            location: .init(path: "/tmp", line: 2, column: 1)
+        )
+        let target = IndexedSymbol(
+            usr: "s:target", name: "helper()", kind: .function, module: "App",
+            location: .init(path: "/tmp", line: 20, column: 1)
+        )
+        let snapshot = IndexSnapshot(
+            symbols: [setup, target],
+            references: [IndexedReference(sourceUSR: "s:setup", targetUSR: "s:target", kind: .call,
+                location: .init(path: "/tmp", line: 4, column: 30))]
+        )
+        let result = BridgeSymbolResolver(snapshot: snapshot, freshPaths: ["/tmp"]).resolve([
+            ScannedBridgeFact(fact: inline, declaration: declaration),
+            ScannedBridgeFact(fact: methodReference, declaration: declaration)
+        ])
+        #expect(result.first?.handlerScope?.complete == false)
+        #expect(result.first?.dependencies?.count == 1)
+    }
+
     @Test("SDK 참조 위치를 브리지의 감싸는 선언으로 사용하지 않는다")
     func externalOccurrenceIsNotADeclaration() {
         let site = SourceLocation(path: "/p/Plugin.swift", line: 3, column: 6)
@@ -471,6 +855,7 @@ struct BridgeFactsTests {
         #expect(first.contains("\"platform\" : \"swift\""))
         #expect(first.contains("\"generatedAt\" : \"2026-09-04T00:00:00.000Z\""))
         #expect(first.contains("\"dynamic\" : false"))
+        #expect(!first.contains("channelPrefix"))
 
         let decoded = try JSONDecoder().decode(BridgeFactsDocument.self, from: Data(first.utf8))
         #expect(decoded.facts.count == 2)
@@ -489,6 +874,242 @@ struct BridgeFactsTests {
         #expect(document.limitations.contains { $0.hasPrefix("objc-named-classes: 1 module-export and 1 method-handle") })
         #expect(document.limitations.contains { $0.hasPrefix("unscanned-event-channels: 1") })
         #expect(document.limitations.contains { $0.hasPrefix("unscanned-message-channels: 1") })
+    }
+
+    @Test("messages 문서는 BasicMessageChannel 핸들러만 v2로 내보내고 기본 v1은 유지한다")
+    func exportsBasicMessageDocument() throws {
+        let source = """
+            let basic = BasicMessageChannel<Any?>(name: "dev.flutter.pigeon.CameraApi.takePhoto", binaryMessenger: m)
+            basic.setMessageHandler { _, _ in }
+            basic.setMessageHandler(nil)
+            FlutterMethodChannel(name: "camera", binaryMessenger: m).setMethodCallHandler { _, _ in }
+            """
+        let service = makeService(files: ["/p/A.swift": source], snapshot: IndexSnapshot())
+        let messageDocument = try service.bridgeFacts(
+            generatedAt: fixedDate, target: .flutter, messages: true
+        )
+        #expect(messageDocument.version == 2)
+        #expect(messageDocument.transport == "basic-message-channel")
+        #expect(messageDocument.platform == "swift")
+        #expect(messageDocument.facts.map(\.kind) == ["message-handle"])
+        #expect(messageDocument.facts.first?.method == nil)
+        #expect(!messageDocument.limitations.contains { $0.hasPrefix("unscanned-message-channels:") })
+        let json = try service.exportBridgeFacts(
+            generatedAt: fixedDate, target: .flutter, messages: true
+        ).output
+        #expect(json.contains("\"transport\" : \"basic-message-channel\""))
+        #expect(json.contains("\"version\" : 2"))
+        #expect(json.contains("\"kind\" : \"message-handle\""))
+        #expect(!json.contains("\"method\""))
+
+        let defaultDocument = try service.bridgeFacts(generatedAt: fixedDate, target: .flutter)
+        #expect(defaultDocument.version == 1)
+        #expect(defaultDocument.transport == nil)
+        #expect(defaultDocument.facts.map(\.kind) == ["channel-register"])
+        #expect(defaultDocument.limitations.contains { $0.hasPrefix("unscanned-message-channels: 1") })
+    }
+
+    @Test("messages 는 두 closure를 구분하고 setup 밖 공유 reference와 dispatch 후보를 보존한다")
+    func exportsMessageExecutionDependencies() throws {
+        let source = """
+            class P {
+                static func install() {
+                    let one = BasicMessageChannel<Any?>(name: "one", binaryMessenger: m)
+                    one.setMessageHandler { _, _ in first() }
+                    let two = BasicMessageChannel<Any?>(name: "two", binaryMessenger: m)
+                    two.setMessageHandler { _, _ in second() }
+                    shared()
+                }
+            }
+            """
+        let setup = IndexedSymbol(
+            usr: "s:setup", name: "install()", kind: .method, module: "App",
+            location: .init(path: "/p/A.swift", line: 2, column: 5)
+        )
+        let first = IndexedSymbol(
+            usr: "s:first", name: "first()", kind: .function, module: "App",
+            location: .init(path: "/p/A.swift", line: 3, column: 1)
+        )
+        let second = IndexedSymbol(
+            usr: "s:second", name: "second()", kind: .function, module: "App",
+            location: .init(path: "/p/A.swift", line: 5, column: 1)
+        )
+        let shared = IndexedSymbol(
+            usr: "s:shared", name: "shared()", kind: .function, module: "App",
+            location: .init(path: "/p/A.swift", line: 6, column: 1)
+        )
+        let requirement = IndexedSymbol(
+            usr: "s:req", name: "first()", kind: .method, module: "App",
+            location: .init(path: "/p/A.swift", line: 8, column: 1)
+        )
+        let implementation = IndexedSymbol(
+            usr: "s:impl", name: "first()", kind: .method, module: "App",
+            location: .init(path: "/p/A.swift", line: 9, column: 1)
+        )
+        let references = [
+            // 호출 위치는 `in` 뒤의 본문이다 — 시그니처(`{ _, _ in` 앞쪽)는 등록 근거다.
+            IndexedReference(sourceUSR: "s:setup", targetUSR: "s:req", kind: .call,
+                location: .init(path: "/p/A.swift", line: 4, column: 41)),
+            IndexedReference(sourceUSR: "s:setup", targetUSR: "s:second", kind: .call,
+                location: .init(path: "/p/A.swift", line: 6, column: 41)),
+            IndexedReference(sourceUSR: "s:setup", targetUSR: "s:shared", kind: .call,
+                location: .init(path: "/p/A.swift", line: 7, column: 5)),
+            IndexedReference(sourceUSR: "s:impl", targetUSR: "s:req", kind: .overrides,
+                location: .init(path: "/p/A.swift", line: 9, column: 1)),
+        ]
+        let snapshot = IndexSnapshot(symbols: [setup, first, second, shared, requirement, implementation], references: references)
+        let service = makeService(files: ["/p/A.swift": source], snapshot: snapshot)
+        let data = Data(try service.exportBridgeFacts(target: .flutter, messages: true).output.utf8)
+        let document = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let facts = try #require(document["facts"] as? [[String: Any]])
+        #expect(facts.count == 2)
+        #expect(facts.allSatisfy { $0["symbol"] != nil })
+        #expect(facts.allSatisfy { $0["handlerScope"] != nil })
+        #expect(facts.allSatisfy { $0["dependencies"] != nil })
+        #expect(facts.allSatisfy { $0["method"] == nil })
+        let firstFact = try #require(facts.first { $0["channel"] as? String == "one" })
+        let firstScope = try #require(firstFact["handlerScope"] as? [String: Any])
+        #expect(firstScope["complete"] as? Bool == false)
+        let firstDependencies = try #require(firstFact["dependencies"] as? [[String: Any]])
+        #expect(firstDependencies.contains { $0["scope"] as? String == "handler" })
+        #expect(firstDependencies.contains { $0["scope"] as? String == "registration" })
+        let dispatch = firstDependencies.first { dependency in
+            guard let symbol = dependency["symbol"] as? [String: Any] else { return false }
+            return symbol["usr"] as? String == "s:req"
+        }
+        let dependencySymbol = try #require(dispatch?["symbol"] as? [String: Any])
+        #expect(dependencySymbol["qualifiedName"] as? String == "App.first()")
+        let dispatchTargets = try #require(dispatch?["dispatchTargets"] as? [[String: Any]])
+        #expect(dispatchTargets.contains { $0["usr"] as? String == "s:impl" })
+        #expect(dispatchTargets.first?["qualifiedName"] as? String == "App.first()")
+    }
+
+    @Test("requirement부터 두 단계인 override 구현 후보를 모두 보존한다")
+    func exportsTransitiveDispatchTargets() {
+        let scope = BridgeFact.HandlerScope(
+            start: .init(path: "/tmp", line: 4, column: 20),
+            end: .init(path: "/tmp", line: 5, column: 5), complete: false
+        )
+        let declaration = EnclosingDeclaration(
+            name: "install", indexName: "install()", qualifiedName: "P.install", line: 2,
+            start: .init(path: "/tmp", line: 2, column: 1),
+            end: .init(path: "/tmp", line: 8, column: 1)
+        )
+        let symbols = [
+            IndexedSymbol(usr: "s:setup", name: "install()", kind: .function, module: "App",
+                location: .init(path: "/tmp", line: 2, column: 1)),
+            IndexedSymbol(usr: "s:req", name: "run()", kind: .method, module: "App",
+                location: .init(path: "/tmp", line: 10, column: 1)),
+            IndexedSymbol(usr: "s:base", name: "run()", kind: .method, module: "App",
+                location: .init(path: "/tmp", line: 11, column: 1)),
+            IndexedSymbol(usr: "s:sub", name: "run()", kind: .method, module: "App",
+                location: .init(path: "/tmp", line: 12, column: 1)),
+        ]
+        let snapshot = IndexSnapshot(symbols: symbols, references: [
+            IndexedReference(sourceUSR: "s:setup", targetUSR: "s:req", kind: .call,
+                location: .init(path: "/tmp", line: 4, column: 30)),
+            IndexedReference(sourceUSR: "s:base", targetUSR: "s:req", kind: .overrides,
+                location: .init(path: "/tmp", line: 11, column: 1)),
+            IndexedReference(sourceUSR: "s:base", targetUSR: "s:req", kind: .overrides,
+                location: .init(path: "/tmp", line: 11, column: 1)),
+            IndexedReference(sourceUSR: "s:sub", targetUSR: "s:base", kind: .overrides,
+                location: .init(path: "/tmp", line: 12, column: 1)),
+        ])
+        let fact = BridgeFact(
+            kind: .messageHandle, target: .flutter, channel: "run", handlerScope: scope,
+            location: .init(path: "/tmp", line: 4, column: 1)
+        )
+        let resolved = BridgeSymbolResolver(snapshot: snapshot, freshPaths: ["/tmp"]).resolve([
+            ScannedBridgeFact(fact: fact, declaration: declaration)
+        ]).first
+        let targets = resolved?.dependencies?.first?.dispatchTargets.map(\.usr) ?? []
+        #expect(targets == ["s:base", "s:sub"])
+    }
+
+    @Test("override 순환은 중단하고 참조 대상 방향의 후보만 반환한다")
+    func dispatchTargetsRespectDirectionAndCycles() {
+        let scope = BridgeFact.HandlerScope(
+            start: .init(path: "/tmp", line: 4, column: 20),
+            end: .init(path: "/tmp", line: 5, column: 5), complete: false
+        )
+        let declaration = EnclosingDeclaration(
+            name: "install", indexName: "install()", qualifiedName: "P.install", line: 2,
+            start: .init(path: "/tmp", line: 2, column: 1), end: .init(path: "/tmp", line: 8, column: 1)
+        )
+        let symbols = ["setup", "requirement", "base", "sub"].enumerated().map { index, name in
+            IndexedSymbol(usr: "s:\(name)", name: index == 0 ? "install()" : "run()", kind: .method, module: "App",
+                location: .init(path: "/tmp", line: index + 2, column: 1))
+        }
+        let refs = [
+            IndexedReference(sourceUSR: "s:setup", targetUSR: "s:requirement", kind: .call,
+                location: .init(path: "/tmp", line: 4, column: 30)),
+            IndexedReference(sourceUSR: "s:base", targetUSR: "s:requirement", kind: .overrides),
+            IndexedReference(sourceUSR: "s:sub", targetUSR: "s:base", kind: .overrides),
+            IndexedReference(sourceUSR: "s:requirement", targetUSR: "s:sub", kind: .overrides),
+        ]
+        let fact = BridgeFact(kind: .messageHandle, target: .flutter, channel: "run", handlerScope: scope,
+            location: .init(path: "/tmp", line: 4, column: 1))
+        let resolved = BridgeSymbolResolver(snapshot: IndexSnapshot(symbols: symbols, references: refs), freshPaths: ["/tmp"])
+            .resolve([ScannedBridgeFact(fact: fact, declaration: declaration)]).first
+        #expect(resolved?.dependencies?.first?.dispatchTargets.map(\.usr) == ["s:base", "s:sub"])
+
+        let reverse = BridgeFact(kind: .messageHandle, target: .flutter, channel: "base", handlerScope: scope,
+            location: .init(path: "/tmp", line: 4, column: 1))
+        let reverseReferences = [
+            IndexedReference(sourceUSR: "s:setup", targetUSR: "s:base", kind: .call,
+                location: .init(path: "/tmp", line: 4, column: 30)),
+            refs[2],
+        ]
+        let reverseResolved = BridgeSymbolResolver(
+            snapshot: IndexSnapshot(symbols: symbols, references: reverseReferences), freshPaths: ["/tmp"]
+        )
+            .resolve([ScannedBridgeFact(fact: reverse, declaration: declaration)]).first
+        #expect(reverseResolved?.dependencies?.first?.dispatchTargets.map(\.usr) == ["s:sub"])
+    }
+
+    @Test("같은 setup의 MethodChannel closure는 Basic registration dependency로 섞이지 않는다")
+    func excludesMethodHandlerClosureFromMessageRegistrationScope() throws {
+        let source = """
+            class P {
+                static func install() {
+                    FlutterMethodChannel(name: "method", binaryMessenger: m).setMethodCallHandler { _, _ in runtimeNativeValue() }
+                    let basic = BasicMessageChannel<Any?>(name: "basic", binaryMessenger: m)
+                    basic.setMessageHandler { _, _ in basicHelper() }
+                }
+            }
+            """
+        let setup = IndexedSymbol(usr: "s:setup", name: "install()", kind: .method, module: "App",
+            location: .init(path: "/p/A.swift", line: 2, column: 5))
+        let runtime = IndexedSymbol(usr: "s:runtime", name: "runtimeNativeValue()", kind: .function, module: "App",
+            location: .init(path: "/p/A.swift", line: 8, column: 1))
+        let helper = IndexedSymbol(usr: "s:helper", name: "basicHelper()", kind: .function, module: "App",
+            location: .init(path: "/p/A.swift", line: 9, column: 1))
+        let snapshot = IndexSnapshot(symbols: [setup, runtime, helper], references: [
+            IndexedReference(sourceUSR: "s:setup", targetUSR: "s:runtime", kind: .call,
+                location: .init(path: "/p/A.swift", line: 3, column: 110)),
+            IndexedReference(sourceUSR: "s:setup", targetUSR: "s:helper", kind: .call,
+                location: .init(path: "/p/A.swift", line: 5, column: 38)),
+        ])
+        let service = makeService(files: ["/p/A.swift": source], snapshot: snapshot)
+        let data = Data(try service.exportBridgeFacts(target: .flutter, messages: true).output.utf8)
+        let document = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let facts = try #require(document["facts"] as? [[String: Any]])
+        let basic = try #require(facts.first { $0["channel"] as? String == "basic" })
+        let dependencies = try #require(basic["dependencies"] as? [[String: Any]])
+        #expect(dependencies.contains { ($0["symbol"] as? [String: Any])?["usr"] as? String == "s:helper" })
+        #expect(!dependencies.contains { ($0["symbol"] as? [String: Any])?["usr"] as? String == "s:runtime" })
+    }
+
+    @Test("closure 없는 Basic method reference는 명시적인 limitation을 남긴다")
+    func reportsUnscopedMessageHandler() {
+        let document = BridgeFactsDocument(
+            tool: .init(name: "cartograph", version: "test"), generatedAt: "t", project: "/p",
+            facts: [BridgeFact(kind: .messageHandle, target: .flutter, channel: "c",
+                handlerScope: nil, dependencies: nil,
+                location: .init(path: "/p/A.swift", line: 1, column: 1), symbol: .init(qualifiedName: "P.install", usr: "s:p"))],
+            version: BridgeFactsDocument.messageVersion, transport: "basic-message-channel"
+        )
+        #expect(document.limitations.contains { $0.hasPrefix("unscoped-message-handlers: 1") })
     }
 
     @Test("채널을 모르면 키를 빼지 않고 null 로 적는다")

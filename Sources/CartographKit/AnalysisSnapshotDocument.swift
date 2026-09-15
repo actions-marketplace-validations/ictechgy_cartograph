@@ -176,6 +176,7 @@ public struct AnalysisSnapshotDocument: Sendable, Equatable, Codable {
                         ? $0.path : Self.rebase($0.path, from: projectRoot, to: currentProjectRoot),
                           line: $0.line, column: $0.column)
                 },
+                targetKind: reference.targetKind,
                 origin: reference.origin
             )
         }
@@ -419,7 +420,9 @@ extension CartographService {
         }.sorted { left, right in
             let leftKey = Self.referenceOrderKey(left)
             let rightKey = Self.referenceOrderKey(right)
-            return leftKey == rightKey ? left.origin.rawValue < right.origin.rawValue : leftKey < rightKey
+            guard leftKey == rightKey else { return leftKey < rightKey }
+            return (left.origin.rawValue, left.targetKind?.rawValue ?? "")
+                < (right.origin.rawValue, right.targetKind?.rawValue ?? "")
         }
         let capturedDates = context.snapshot.indexedFileDates.map { dates in
             dates.filter { includedSourcePaths.contains($0.key) }

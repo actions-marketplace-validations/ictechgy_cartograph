@@ -87,6 +87,17 @@ struct IndexStoreMappingTests {
         #expect(IndexStoreMapping.indexedSymbol(from: occurrence(symbol("A"), roles: .reference)) == nil)
     }
 
+    @Test("reference 대상의 parameter 종류를 보존해 graph 밖 대상을 구분한다")
+    func preservesReferenceTargetKind() {
+        let references = IndexStoreMapping.references(
+            from: occurrence(
+                symbol("arg", kind: .parameter), roles: .reference,
+                relations: [SymbolRelation(symbol: symbol("setup", kind: .function), roles: .containedBy)]
+            )
+        )
+        #expect(references.first?.targetKind == .parameter)
+    }
+
     @Test("접근자와 지역 선언, 파라미터는 제외한다")
     func skipsNoiseDeclarations() {
         let getter = symbol("g", kind: .instanceMethod, subKind: .accessorGetter)
@@ -551,7 +562,7 @@ struct UnattributedReferenceTests {
         // 있을 때만 간선을 만들면 페이로드 타입은 아무도 쓰지 않는 것처럼 보이고,
         // 실제로는 지우면 컴파일이 깨진다. 오늘은 합성 init 이 우연히 살리고 있다.
         let references = IndexStoreProvider.enclosingReferences(
-            for: [(usr: "s:Payload", location: at(6, 16))],
+            for: [(usr: "s:Payload", location: at(6, 16), targetKind: .structType)],
             definitionSites: ["/p/A.swift": [
                 (usr: "s:Failure", location: at(5, 6)),
                 (usr: "s:broke", location: at(6, 10)),
@@ -563,12 +574,14 @@ struct UnattributedReferenceTests {
         )
         #expect(references.map(\.sourceUSR) == ["s:broke"])
         #expect(references.map(\.targetUSR) == ["s:Payload"])
+        // 대상이 심볼 사전에 없어도(그래프 밖) 발생이 보고한 종류를 보존한다.
+        #expect(references.first?.targetKind == .structType)
     }
 
     @Test("타입 별칭의 우변도 같은 방식으로 붙는다")
     func typeAliasRightHandSideGetsAnEdge() {
         let references = IndexStoreProvider.enclosingReferences(
-            for: [(usr: "s:Aliased", location: at(9, 22))],
+            for: [(usr: "s:Aliased", location: at(9, 22), targetKind: .structType)],
             definitionSites: ["/p/A.swift": [(usr: "s:Shortcut", location: at(9, 11))]],
             symbols: ["s:Shortcut": symbol("s:Shortcut", kind: .typeAlias, line: 9)]
         )
@@ -582,7 +595,7 @@ struct UnattributedReferenceTests {
         // 자리가 아니라 속성 줄이다. 넓게 잡으면 앞 선언에 붙어 없는 의존성을 만든다.
         // 실제로 `@Observable` 이 그 모양으로 거짓 순환 두 건을 만들었다.
         let references = IndexStoreProvider.enclosingReferences(
-            for: [(usr: "s:Other", location: at(50, 2))],
+            for: [(usr: "s:Other", location: at(50, 2), targetKind: .structType)],
             definitionSites: ["/p/A.swift": [(usr: "s:id", location: at(42, 9))]],
             symbols: ["s:id": symbol("s:id", kind: .property, line: 42)]
         )
@@ -594,7 +607,7 @@ struct UnattributedReferenceTests {
         // 이름 없는 파라미터는 자기 타입과 같은 자리에 기록된다. 그것을 소유자로 뽑으면
         // 파라미터는 그래프의 정점이 아니라 간선이 통째로 사라진다.
         let references = IndexStoreProvider.enclosingReferences(
-            for: [(usr: "s:Payload", location: at(6, 16))],
+            for: [(usr: "s:Payload", location: at(6, 16), targetKind: .structType)],
             definitionSites: ["/p/A.swift": [
                 (usr: "s:broke", location: at(6, 10)),
                 (usr: "s:param", location: at(6, 16)),
@@ -610,7 +623,7 @@ struct UnattributedReferenceTests {
     @Test("앞에 정의가 없으면 아무 데도 붙이지 않는다")
     func referencesBeforeAnyDefinitionAreDropped() {
         let references = IndexStoreProvider.enclosingReferences(
-            for: [(usr: "s:Imported", location: at(1, 8))],
+            for: [(usr: "s:Imported", location: at(1, 8), targetKind: .structType)],
             definitionSites: ["/p/A.swift": [(usr: "s:Later", location: at(5, 1))]],
             symbols: ["s:Later": symbol("s:Later", kind: .enumCase, line: 5)]
         )

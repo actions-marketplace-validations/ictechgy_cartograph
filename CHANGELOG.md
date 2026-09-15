@@ -7,6 +7,53 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-09-16
+
+### Fixed
+
+- `setMessageHandler` on receivers the scanner cannot bind — parameters, fields, opaque
+  expressions — still yields a `message-handle` fact with a dynamic channel name and its handler
+  scope, instead of dropping the handler and contaminating shared registration evidence.
+- Single-channel inference for `FlutterMethodCall` handlers counts only method channels again,
+  so a Basic-message or event channel declared in the same file no longer defeats the guess or
+  lends its name to a method handler.
+- Handler scopes start at the closure `in` keyword, so capture-list initializers such as
+  `{ [s = make()] _, _ in … }` classify as registration evidence instead of per-message work.
+- Ambiguous evidence is reported rather than guessed: equidistant same-label symbols no longer
+  pick a USR by sort order, external requirements with in-project implementations mark the
+  handler scope incomplete, and top-level registrations attach the file's virtual top-level
+  symbol so every fact carries an enclosing symbol.
+- Inferred enclosing-symbol and conformance references keep the index-reported `targetKind`
+  even when the target is outside the graph, and snapshot reference ordering is fully
+  deterministic down to `targetKind`.
+
+## [0.15.0] - 2026-09-16
+
+### Added
+
+- `cartograph bridges --messages --target flutter` exports Flutter `BasicMessageChannel` and Pigeon
+  handler facts in the bridge-facts v2 exchange format. Each `message-handle` fact keeps the
+  enclosing setup symbol and adds the handler closure range plus the call/reference symbols the
+  compiler index actually observed at those locations, split into `registration` and `handler`
+  scopes. Verified override dispatch candidates are preserved transitively so a change to a
+  sub-override still reaches the bridge boundary. The scope was checked against the public
+  `url_launcher_macos@3.2.2` generated Swift source; it is not a compatibility promise for every
+  Pigeon form.
+- `IndexedReference` records the index-reported `targetKind`, letting consumers distinguish
+  graph-excluded targets such as parameters instead of treating every reference target alike.
+- Handler dependency evidence is bounded by a document-wide budget and classified once per
+  declaration, so large shared registration functions no longer rescan or recopy scopes per fact.
+
+### Fixed
+
+- Handler scopes with missing, stale, ambiguous or budget-bounded evidence stay `complete: false`
+  and are counted under `incomplete-message-handler-scopes` instead of looking fully analyzed.
+  Scopes duplicated through path aliases are merged rather than conflicted.
+- Method-channel handler closures no longer leak helper references into a sibling
+  Basic-message-channel registration scope when both kinds share one setup function.
+- References rebuilt while normalizing synthesized symbols, restoring local functions and rebasing
+  snapshots keep their `targetKind` instead of resetting it.
+
 ## [0.14.0] - 2026-09-15
 
 ### Added
@@ -966,7 +1013,9 @@ First release.
 - macOS only in practice: the index store format and `libIndexStore` discovery are Apple-toolchain
   specific.
 
-[Unreleased]: https://github.com/ictechgy/cartograph/compare/0.14.0...HEAD
+[Unreleased]: https://github.com/ictechgy/cartograph/compare/0.15.1...HEAD
+[0.15.1]: https://github.com/ictechgy/cartograph/compare/0.15.0...0.15.1
+[0.15.0]: https://github.com/ictechgy/cartograph/compare/0.14.0...0.15.0
 [0.14.0]: https://github.com/ictechgy/cartograph/compare/0.13.0...0.14.0
 [0.13.0]: https://github.com/ictechgy/cartograph/compare/0.12.0...0.13.0
 [0.12.0]: https://github.com/ictechgy/cartograph/compare/0.11.0...0.12.0
