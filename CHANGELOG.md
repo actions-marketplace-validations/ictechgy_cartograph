@@ -7,6 +7,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The no-index-store error now reads the project root and tailors its build guidance to what
+  it finds: a `Package.swift` gets the `swift build` line (plus a note when `.build` exists but
+  holds no store), an `.xcodeproj`/`.xcworkspace` gets an `xcodebuild` command with the document
+  and `-scheme` flags filled in, both get both, and a root with neither is told to check
+  `--project` instead of being shown commands that cannot run there. The `indexStoreEmpty`
+  remedies that end in build commands follow the same shape.
+
+### Added
+
+- `dead` now reports parameters that a reachable function's body never reads, under the
+  `unused-parameter` rule at warning severity. The index does not record references to local
+  symbols, so usage is proven by a SwiftSyntax body scan (scope-aware for nested functions,
+  closures, and capture lists) joined to indexed parameter declarations by source position.
+  Parameters of protocol requirements, dead functions, and unscanned files are never reported,
+  and the warnings do not count toward `--strict` — the fix is a `_` name, not a deletion.
+- `dead` now reports properties that are assigned but never read, under the `assign-only` rule
+  at warning severity. The index records a read/write role on every property reference, so the
+  facts come straight from `SymbolOccurrence.roles`: undirected memberwise-initializer argument
+  labels count as writes, while implicit, dynamic, `addressOf`, or direction-less call accesses
+  mark the property's evidence ambiguous and suppress the finding entirely. Protocol
+  requirements and witnesses (whose reads record on the requirement symbol), overrides,
+  runtime-managed and Objective-C/Interface Builder-exposed declarations, and stored properties
+  of types with synthesized `Equatable`/`Hashable`/`Codable` conformances are excluded. The
+  warnings do not count toward `--strict`.
+- `dead` now reports `import` declarations a file's references never use, under the
+  `unused-import` rule at warning severity. A Swift USR encodes its owning module
+  (`s:<length><module>`), so each file's referenced-module set is recovered from the index;
+  `import M` marker occurrences (`c:@M@M`) never count as usage. Reporting is suppressed
+  whenever evidence is incomplete: files with unattributable references (clang/Objective-C
+  USRs carry no module), files that reference modules they never imported (a re-export may
+  supply them), conditional (`#if`) imports, re-exporting imports (`@_exported`, `public
+  import`), and `cartograph:ignore`-marked imports are all excluded. The warnings do not
+  count toward `--strict`.
+
 ## [0.15.1] - 2026-09-16
 
 ### Fixed

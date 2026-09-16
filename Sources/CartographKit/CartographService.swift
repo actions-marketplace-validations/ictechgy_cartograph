@@ -218,7 +218,10 @@ public struct CartographService: Sendable {
         let limitations = analysisLimitations(context: context, symbolGraph: graph)
         return try finish(
             AnalysisDiagnostics.diagnostics(for: report)
-                + AnalysisDiagnostics.testOnlyDiagnostics(for: report),
+                + AnalysisDiagnostics.testOnlyDiagnostics(for: report)
+                + AnalysisDiagnostics.unusedParameterDiagnostics(for: report, in: graph)
+                + AnalysisDiagnostics.assignOnlyDiagnostics(for: report, in: graph)
+                + AnalysisDiagnostics.unusedImportDiagnostics(for: report),
             command: "dead",
             subject: "\(describe(graph)) · \(report.reachableCount)/\(report.totalCount) reachable",
             thresholdLimit: configuration.thresholds.maxUnusedSymbols,
@@ -1382,7 +1385,9 @@ public struct CartographService: Sendable {
             sourceFileCount: counts.total,
             filteredSourceFileCount: counts.inScope,
             objectiveCSourceCount: counts.objectiveC,
-            unitCount: indexUnitCount(at: source)
+            unitCount: indexUnitCount(at: source),
+            projectShape: IndexStoreLocator(fileSystem: environment.fileSystem)
+                .projectShape(at: projectPath)
         )
     }
 

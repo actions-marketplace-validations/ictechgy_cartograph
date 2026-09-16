@@ -208,6 +208,55 @@ cartograph dead --explain UserRepository
 Dead code is defined as *unreachable from a retained root*, not *zero references*. A cluster of
 declarations that only reference each other has plenty of references and is still dead.
 
+`dead` also reports parameters a live function's body never reads, as warnings under the
+`unused-parameter` rule:
+
+```console
+Sources/Net/Client.swift:42:30: warning: parameter 'retry' of 'Net.Client.fetch(_:retry:)' is never used
+```
+
+The index does not record references to local symbols, so usage is proven by scanning the
+function body itself. A parameter is reported only when its function is reachable; parameters of
+protocol requirements (which have no body) and parameters in files that could not be scanned are
+never reported. `unused-parameter` warnings are not counted toward `--strict` — the fix is a `_`
+name, not a deletion.
+
+`dead` also reports properties that are assigned but never read, as warnings under the
+`assign-only` rule:
+
+```console
+Sources/Net/Client.swift:17:9: warning: property 'cacheKey' of 'Net.Client' is assigned but never read
+```
+
+The index records a read/write role on every property reference, so this check needs no source
+scan. A property is reported only when it is reachable and every observed access is a write —
+memberwise-initializer argument labels count as writes. Protocol requirements and witnesses are
+excluded (reads through the protocol record on the requirement symbol), as are overrides,
+runtime-managed declarations (`@NSManaged`, `@Observable`), Objective-C- and Interface
+Builder-exposed members, implicit declarations, and stored properties of types whose synthesized
+`Equatable`/`Hashable`/`Codable` conformances read them without leaving index evidence. Accesses
+with ambiguous direction — `&x`, dynamic dispatch, macro-expanded or implicit references —
+suppress the finding rather than guess. Like `unused-parameter`, these warnings are not counted
+toward `--strict`: the fix may be an observation point, not a deletion.
+
+`dead` also reports `import` declarations the file's references never use, as warnings under the
+`unused-import` rule:
+
+```console
+Sources/Net/Client.swift:3:1: warning: import 'Combine' is never used
+```
+
+A Swift USR encodes its owning module, so the set of modules a file actually references is
+recovered from the index; the `c:@M@M` marker an `import` itself leaves behind never counts as
+usage. Because usage can also arrive through a re-export, reporting is deliberately
+conservative: an import is reported only when the file's usage evidence is complete — no
+unattributable references (clang/Objective-C USRs carry no module) and no referenced module the
+file never imported. Conditional (`#if`) imports, re-exporting imports (`@_exported`,
+`public import`), and imports marked `// cartograph:ignore` are never reported. Scoped imports
+like `import struct Foundation.Bundle` are judged by their head module — a use of anything in
+`Foundation` counts as use of the import — and the diagnostic spells the full form. Like the
+other warning rules, `unused-import` does not count toward `--strict`.
+
 `--report-test-only` answers a different question: which production declarations are reached
 **only** from tests or previews. They are not dead — deleting one breaks a test — but a team wants
 to know that tests are the sole caller. Reported as `info`, so they never fail a build.

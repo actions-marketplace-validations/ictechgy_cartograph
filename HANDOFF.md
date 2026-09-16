@@ -1,5 +1,245 @@
 # Handoff
 
+## 2026-09-16 — 인덱스 없음 안내의 프로젝트 형태 맞춤 (feat/competitive-hardening)
+
+`우선순위대로 개선` 4번째(빌드/인덱스 온보딩 마찰). 커밋 `0551343`.
+"인덱스 없음 안내 강화 또는 선택적 빌드 프리스텝" 중 안내 강화를 택했다 —
+"Cartograph never drives your build"가
+README의 설계 원칙이고 스킬 문서가 "never runs a build"를 가르치며, 프리스텝은
+scheme을 모르는 Xcode 프로젝트엔 어차피 못 돌아가기 때문이다.
+
+### 설계
+
+- `ProjectShape`(CartographCore): 루트의 빌드 진입점 사실 — `hasPackageManifest`,
+  `hasBuildDirectory`(.build만 있고 스토어는 없음 = 해석/중단 빌드),
+  `xcodeDocuments`(워크스페이스 우선 정렬).
+- `IndexStoreLocator.projectShape(at:)`가 실패 경로에서만 루트를 한 번 훑어 형태를
+  만들고 `indexStoreNotFound`의 세 번째 연관 값(기본 nil, 하위 호환)으로 실린다.
+- 형태별 치유책: 패키지 → `swift build`만(+`.build` 흔적 문장, `-Xswiftc` 무시 경고),
+  Xcode 문서 → 문서 플래그와 `-scheme`을 채운 `xcodebuild` + `xcodebuild -list`,
+  둘 다 → 둘 다, 없음 → `--project` 경로 의심. 없음 루트에 `swift build`를 권하는
+  것은 그대로 실행해도 실패하는 안내라 넣지 않는다.
+- `EmptyIndexFacts`도 같은 형태를 받아 `nothingCompiled`/`unknownStore` 치유책의
+  빌드 명령이 형태를 따른다(`buildCommandsBlock` — 형태 없으면 기존 두 줄 유지).
+- 회귀: `reportsSearchedPaths`를 Package.swift 루트로 옮겼다 — 빈 루트는 이제
+  "진입점 없음" 형태라 swift build 안내가 나오지 않는 게 맞다.
+
+### 검증 근거
+
+- `swift test` 1432개 통과(신규 12: 형태 문장 8·로케이터 연결 3·빈 인덱스 1).
+- 변이 확인: remedy를 형태 무시로 바꾸면 형태별·연결 테스트가 전부 실패,
+  워크스페이스 우선을 빼면 해당 테스트만 실패, buildCommandsBlock이 형태를
+  무시하면 빈 인덱스 테스트가 실패 — 전부 문다.
+
+### 다음
+
+우선순위 목록 전부 완료 — P3 재측정·warm 단축, P2-1 미사용 파라미터(`cbdb6c9`),
+P2-2 assign-only(`f72af38`), P2-3 미사용 import(`7fb815f`), P4 온보딩 안내(이 항목).
+브랜치 정리·PR 여부는 지시 대기.
+
+---
+
+## 2026-09-16 — 미사용 import 분석 (feat/competitive-hardening)
+
+`우선순위대로 개선` 3번째(분석 커버리지)의 셋째 항목. `dead`가 파일의 참조 근거가
+증명하지 못하는 `import`를 `unused-import` 경고로 보고한다. 커밋 `7fb815f`.
+
+### 설계
+
+- 재료가 두 출처에서 온다. 인덱스는 "파일이 어느 모듈의 선언을 참조했는가"를
+  모으고(`IndexSnapshot.fileModuleUsages`), 구문 분석은 import 선언의 속성·`#if`·
+  무시 주석을 모은다(`IndexSnapshot.imports`, `ImportScanner` → `SnapshotEnricher`).
+  판정은 `UnusedImportAnalyzer.analyze(_:)` 순수 함수 — 그래프 정점을 쓰지 않는다.
+- 모듈 귀속(`IndexStoreMapping.moduleEvidence(ofUSR:)`): `s:<길이><모듈>`은 USR에서
+  직접 읽는다. `s:` 다음이 숫자가 아닌 형태(`s:Si` 등 stdlib·컴파일러 생성)와
+  `c:@M@…`(import 문이 남기는 모듈 심볼 표식)은 묵시로 둔다 — 후자를 사용으로
+  세면 모든 import가 자기 자신 때문에 "사용됨"이 된다. `c:`/`e:` 같이 모듈을
+  담지 않는 USR은 지연시켜, 선언 사전이 완성된 뒤 프로젝트 인덱스 안 선언으로 푼다.
+  끝내 못 푼 것은 `hasUnattributedReferences` — 그 파일의 import는 전부 보류.
+- 보고 조건(전부 보존 방향): 참조 모듈 집합에 없는 모듈 + 조건부/재수출/무시
+  아님 + 미귀속 참조 없음 + 미설명 모듈 없음 또는 통로 아님 증명.
+- **재수출이 핵심 난제다.** `import ArgumentParser`만 한 파일이 Foundation 심볼을
+  쓰는 게 실측으로 확인됐다(외부 모듈의 재수출). 미설명 모듈이 있으면 외부 import는
+  전부 억제하고, 프로젝트 모듈은 `@_exported`/`public import`의 전이 폐포로 통로
+  여부를 판정한다. 폐포가 외부 모듈에 닿으면 그 안의 재수출은 볼 수 없어 어떤
+  미설명 모듈이든 전달할 수 있다고 본다.
+- 묵시 가용 모듈(`Swift`·`_Concurrency`·`_StringProcessing`·`ObjectiveC`)과 자기
+  모듈(`location.moduleName`)은 미설명에서 뺀다. Darwin·Dispatch는 확실하지 않아
+  목록에 넣지 않았다 — 미설명으로 남으면 억제되므로 그쪽이 안전하다.
+- `SnapshotBuilder`에 `importDecl`/`fileModuleUsage` 추가. 옛 스냅샷 문서는
+  `decodeIfPresent` 기본값으로 읽는다. `rebased(to:)`는 경로를 재기준화하고
+  `captureSnapshot`은 남은 파일의 것만 담는다.
+
+### 도그푸딩 결과
+
+자기 저장소에서 12건 발견, 전부 실제로 제거해 빌드 통과를 확인했다. 발견 후
+`dead`는 0건을 보고한다. 43/173 파일이 보수 억제 대상이었다(37 clang 미귀속,
+6 미설명 모듈) — 억제 없이는 오탐이 됐을 경로다.
+
+## 2026-09-16 — assign-only 프로퍼티 분석 (feat/competitive-hardening)
+
+`우선순위대로 개선` 3번째(분석 커버리지)의 둘째 항목. `dead`가 대입만 되고 한 번도
+읽히지 않는 프로퍼티·변수를 `assign-only` 경고로 보고한다. 커밋 `f72af38`.
+
+### 설계
+
+- 파라미터와 달리 **사용 근거가 인덱스에 있다** — 프로퍼티 참조 발생에 read/write
+  역할이 붙는다(실측: read 12,187·write 1,320·양쪽 568). 구문 스캔 불필요.
+- 흐름: `IndexStoreMapping.propertyAccess(of:)`가 발생의 역할을
+  `PropertyAccessFacts`(hasRead/hasWrite/hasAmbiguous)로 분류 → 프로바이더가 USR별로
+  접어 `IndexSnapshot.propertyAccesses` → `ReachabilityAnalyzer.assignOnlyProperties`가
+  `isAssignOnly`(쓰기만 있고 읽기·불명 없음)이고 도달 가능한 정점만 보고.
+- 역할 해석(실측 근거):
+  - `ref|read`/`ref|write`/`ref|read|write`(`+=`)는 그대로 센다.
+  - 방향 없는 `ref|contBy` 1,186건은 전부 멤버와이즈 init 인자 라벨 — 값이 그 자리로
+    들어가는 자리이므로 **쓰기**로 센다.
+  - `.implicit`/`.dynamic`/`.addressOf`가 붙으면 방향 비트와 무관하게 **불명** —
+    `&x`는 write만 달고도 피호출자가 읽을 수 있다. 방향 없는 `.call`도 불명.
+  - **접근자 USR에 기록되는 발생은 버린다** — 모든 접근이 프로퍼티 자체 외에
+    `getter:x`/`setter:x`에도 `ref|call|implicit`으로 남는다(15,771건). 그것까지
+    합치면 전부 불명이 되어 질의가 죽는다. kind 가드가 접근자를 자연히 걸러낸다.
+- `$x` 투영값의 접근은 원래 `x`로 합친다(`propertyWrapperFacets` 재사용). `_x`
+  저장소는 합치지 않는다 — 합성 이니셜라이저 잡음 때문(간선 접기와 같은 선택).
+- 보고 제외(전부 보존 방향): 도달 불가, excludedKinds, `.implicit`/`.ignoreComment`/
+  `.runtimeManaged`/`.dynamicDispatch`/`.dynamicReplacement`/ObjC·IB 속성, 프로토콜
+  요구사항 멤버, `.overrides` 간선 보유자(오버라이드·준수 증인 — 읽기가 요구사항
+  심볼에 기록됨), **합성 준수 소유자** — `Equatable`/`Hashable`/`Encodable`/`Decodable`
+  (USR `s:SQ`/`s:SH`/`s:SE`/`s:Se`) 합성 본문은 소스 위치가 없어 읽기가 인덱스에
+  안 남는다. 외부 프로토콜은 그래프 정점이 아니므로 `snapshot.references`의
+  `.conformance` 참조를 직접 본다. 익스텐션에 선언된 준수는 `.extends` 간선으로
+  확장 대상 타입에 전파한다(어휘적 부모·의미상 부모 둘 다 검사).
+- `assign-only`도 `countedRules: [unusedSymbol]` 밖 — strict·임계값에 안 잡힌다.
+- `IndexSnapshot`에 `propertyAccesses` 필드 — 없는 옛 문서는 빈 표로 읽는다.
+  캡처는 포함된 USR만, 리베이스는 USR 키라 그대로 전달.
+
+### 한계 (알려진 것)
+
+- `_x.wrappedValue`/`_x.publisher`처럼 저장소 곁가지로만 읽는 래퍼 프로퍼티는
+  접기지 않아 읽기를 놓칠 수 있다 — 드문 패턴이며 미탐이 아니라 오탐 방향이라
+  추가 근거가 생기면 `_x` 접기를 검토.
+- Mirror 같은 순수 런타임 반사는 인덱스에 흔적이 없다.
+- 자기 분석에서 정탐 6건: `FunctionBinding.ownerUSR`, `QuerySession.baseline`,
+  `Container.scope`, `Request.scope`, `FieldInfo.binding`, `CommandContext.warnings`
+  — 전부 쓰기만 되는 진짜 데드 필드.
+
+### 검증 근거
+
+- `swift test` 전체 통과(신규 29: 분석 17·역할 변환 9·스냅샷 호환 3).
+- 각 제외를 하나씩 꺼서 대응 테스트가 실패함을 확인(overrides·합성 준수·
+  isAssignOnly·runtimeManaged — 전부 문다).
+- `dead --strict` exit 0(179 경고 = 파라미터 173 + assign-only 6, 카운트 제외),
+  `cycles`/`cycles --level type`/`rules --strict` 전부 no findings.
+- `Scripts/coverage.sh`·`verify-cli-contract.sh`·`verify-fixtures.sh` 통과.
+
+### 다음 (우선순위 순서)
+
+3-3. 미사용 import — 래퍼 속성·매크로·합성 코드가 만드는 간접 사용을 보수적으로.
+4. 빌드/인덱스 온보딩 마찰: 인덱스 없음 안내 강화 또는 선택적 빌드 프리스텝.
+
+---
+
+## 2026-09-16 — 미사용 파라미터 분석 (feat/competitive-hardening)
+
+`우선순위대로 개선` 3번째(분석 커버리지)의 첫 항목. `dead`가 살아 있는 함수의 본문에서
+한 번도 읽히지 않는 파라미터를 `unused-parameter` 경고로 보고한다.
+
+### 설계
+
+- 인덱스는 **지역 심볼의 참조 발생을 기록하지 않는다** — 파라미터 사용 여부는 인덱스
+  occurrence로 알 수 없다(실측: `decode(_ data:)`의 본문 사용에 대응하는 occurrence 없음).
+  그래서 이 기능은 "그래프 질의"가 아니라 인덱스 선언 + 구문 스캔의 조인이다.
+- 흐름: `IndexStoreMapping.indexedParameter`가 `.parameter` 선언 발생을 수집(정점 아님,
+  `_`·암시적·시스템 제외) → `IndexSnapshot.parameters` → `ParameterUsageScanner`가 본문
+  있는 함수의 파라미터별 `isUsedInBody`를 수집 → `SnapshotEnricher`가 내부 이름 토큰의
+  (줄, 열)로 조인해 `IndexedParameter.isReferenced`를 채움 → `ReachabilityAnalyzer`는
+  `isReferenced == false`이고 부모 함수가 도달 가능하며 프로토콜 요구사항이 아닌 것만 보고.
+- `isReferenced`는 삼값: `nil`=근거 없음(스캔 못 한 파일·본문 없는 선언·조인 실패) →
+  절대 보고하지 않는다. 보수 방향이 미사용 보고로 새지 않게 하는 장치.
+- 스캐너는 스코프 스택으로 동작한다 — 안쪽 바인딩이 먼저 이기므로 섀도는 "미사용" 쪽이고
+  캡처는 "사용" 쪽이다. 클로저 캡처 `[x]`는 바깥 x의 사용이고 `[x = 식]`의 식도 바깥
+  스코프다. `foo.x`의 멤버 이름은 파라미터 사용이 아니다.
+- `unused-parameter`는 `countedRules: [unusedSymbol]` 밖이라 `--strict`와 임계값에 안 잡힌다.
+  고치는 법이 삭제가 아니라 `_` 표기이므로.
+- `analysisRevision` 18→19 (캐시 무효화). 옛 스냅샷 문서·옛 사실 캐시는 `parameters`/
+  `parameterUsages` 부재로 자연히 `nil`(모름)이 된다.
+
+### 한계 (알려진 것)
+
+- **본문 안 `let x`·`for x` 같은 지역 바인딩 섀도는 추적하지 않는다** — 파라미터와 같은
+  이름의 지역 변수가 생기면 그 참조가 파라미터 사용으로 세어져 미탐이 된다(보수 방향).
+  거짓 보고 방향은 아니다.
+- 접근자 파라미터(`set(v)`의 `v`, `newValue`)는 스코프를 열지 않는다 — 인덱스의 부모도
+  정점이 아니라 어차피 보고되지 않는다.
+- 소스가 인덱스보다 새로우면 위치 조인이 빗나가 `nil`(보고 안 함)로 기운다 — 위치 충돌로
+  엉뚱한 판정이 붙는 아주 드문 경우를 제외하고는 보수 방향.
+- 자기 분석에서 173건의 정탐 경고가 나온다(visitPost no-op, 델리게이트 스텁,
+  `type: T.Type` 추론용 파라미터 등). 경고라 strict는 통과한다.
+
+### 검증 근거
+
+- `swift test` 1356개 통과(신규 32: 스캐너 18·분석 7·보강 조인 4·스냅샷 호환 3).
+- `Scripts/coverage.sh` 92.86% 통과(instrumented CLI 포함), `verify-cli-contract.sh`·
+  `verify-fixtures.sh` 통과.
+- `dead --strict` exit 0(173 경고, 카운트 제외), `cycles`/`cycles --level type`/`rules
+  --strict` 전부 no findings — 도그푸딩이 `ExpressionMarker↔Collector` 타입 순환을 잡아
+  클로저 주입(`ReferenceMarker`)으로 고쳤다.
+- 섀도 단축(`break`)을 빼면 섀도 테스트가 실패함을 확인(테스트가 문다).
+- Alamofire에서 정탐 표본 확인: `task(for:using:)`의 fatalError 스텁, 델리게이트에서
+  주석에만 있는 `session`, `of type:` 메타타입 파라미터.
+
+### 다음 (우선순위 순서)
+
+3-2. assign-only 프로퍼티 → 미사용 import.
+4. 빌드/인덱스 온보딩 마찰: 인덱스 없음 안내 강화 또는 선택적 빌드 프리스텝.
+
+---
+
+## 2026-09-16 — 경쟁 도구 비교 후속: 난이도 과제 측정 + warm 질의 2× (feat/competitive-hardening)
+
+`우선순위대로 개선` 지시에 따른 진행 중. 브랜치 `feat/competitive-hardening`(cartograph-competitive
+워크트리, origin/main `b5c9b84` 기반)에 커밋 2개.
+
+### 완료
+
+1. **난이도 과제 재측정** (`6a6921b`): `Scripts/benchmark-harder-tasks.py`가 H1~H6을 기계 채점.
+   구조적 격차 확인 — LSP `implementation`이 전이적 구현(Alamofire `UploadRequest`)을 놓치고,
+   지역 함수는 USR이 없어 참조 질의 자체 불가(hover는 됨). Cartograph는 그래프 diff로 고립
+   소비자를 결정적으로 잡는다. 비교 문서: `docs/evaluation/2026-09-16-harder-comparison.md`,
+   재현 fixture: `docs/evaluation/2026-09-16-harder/pigeon-host/`(외부 워크스페이스 불필요).
+   원시 출력·스크래치 코퍼스: `~/Desktop/cartograph-evaluation-20260916/`.
+2. **warm 질의 2×** (`9f0b449`): warm 요청 ~42ms의 전부가 입력 지문 재계산(디렉터리 재열거 +
+   항목별 경로 해석)이었다. `AnalysisInputFingerprintCache`가 디렉터리 목록을
+   `DirectoryListingStamp`(stat 전용, realpath 없음)로 세션 캐시하고,
+   `LocalFileSystem.directoryEntries`는 `readdir`/`d_type` 기반. 릴리스 warm ~22ms.
+
+### 함정 (다시 건드릴 때 주의)
+
+- **경로 철자 계약**: `FileManager.contentsOfDirectory`는 realpath 수준으로 풀린 자식 경로를
+  돌려줬다. `canonicalPath`/`resolvingSymlinksInPath`는 마지막 구성요소만 푼다 — `/var`·`/tmp`
+  같은 링크 조상 아래에서 리터럴 철자가 새면 인덱스 unit 매칭·freshness 조회가 전부 빗나간다
+  (coverage.sh의 "stale source retained a proven connection"이 `actual: []`로 전멸). 루트와
+  링크 항목 키는 모두 `realPath`로 통일. 회귀 테스트:
+  `FileSystemTests.linkedAncestorRootYieldsResolvedPaths`.
+- dedup 방문 키도 같은 해석 수준이어야 한다 — 루트만 realpath고 링크 항목이 canonicalPath면
+  같은 파일을 두 번 센다.
+- `swift build`/`swift test` 동시 실행 금지(`.build` 잠금). 디버그 단계별 타이밍은 착시를 준다 —
+  비율 비교는 릴리스 계측으로만.
+
+### 검증 근거
+
+- `swift test` 1324개 통과, `Scripts/coverage.sh` 92.79% 통과(instrumented CLI 포함),
+  `verify-cli-contract.sh`·`verify-fixtures.sh` 통과, `dead`/`cycles`(모듈·타입)/`rules --strict`
+  전부 no findings.
+- 런타임 발견 동등성: `/tmp/baseline-discovery` 코퍼스에서 findings·상태 분포·ID 집합이
+  베이스라인(`/tmp/base-discover.json`)과 완전 일치.
+
+### 다음 (우선순위 순서)
+
+3. 분석 커버리지: 미사용 파라미터 → assign-only 프로퍼티 → 미사용 import.
+4. 빌드/인덱스 온보딩 마찰: 인덱스 없음 안내 강화 또는 선택적 빌드 프리스텝.
+
+---
+
 ## 2026-09-13 — 5렌즈 감사(성능·보안·구조·기능·사용성) 후속 수정 완료 (PR #85)
 
 사용자 요청으로 전체 재검토를 돌리고 도출된 지적을 [PR #85](https://github.com/ictechgy/cartograph/pull/85)로
