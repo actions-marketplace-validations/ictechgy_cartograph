@@ -495,6 +495,15 @@ selected/changeScope 심볼, 파일, 모듈, 선택 이슈를 포함한 각 출�
 남습니다. 명시적 미해결은 종료 코드 64, Git에서 유도한 선택과 런타임 근거 미해결은 불완전한
 분석으로 종료 코드 2입니다. 두 그래프의 간선을 합쳐 경로를 만들지 않습니다.
 
+영향 탐색은 변경 집합의 소비자만 걷기 때문에, 변경된 두 파일 사이에서 사라진 간선은
+`affected`에 나타나지 않습니다 — 양 끝점이 전부 변경 범위 안에 들어가기 때문입니다.
+`scopeDiff` 절이 양쪽 변경 범위의 합집합 위에 유도된 서브그래프를 대조해 이 공백을 메웁니다.
+`addedSymbols`/`removedSymbols`는 한쪽 스냅샷의 범위에만 있는 선언이고,
+`addedEdges`/`removedEdges`는 한쪽 그래프에만 있는 간선 삼중(출발, 도착, 종류)입니다.
+상대 그래프의 필터가 담을 수 없던 간선 종류는 보고하지 않으며, 필터가 다르면 `limitations`에
+그 사실을 적습니다. 각 목록은 `--limit`으로 잘리고 `*Count` 필드와 `scopeDiff.truncated`가
+잘리지 않은 실제 개수를 보존합니다.
+
 중첩된 런타임 검토 근거와 계약 ID 목록도 출력 한도를 지킵니다. 생략하면
 `externalEvidenceCount`/`externalEvidenceOmitted` 또는
 `runtimeContractsCount`/`runtimeContractsOmitted`로 전체/생략 개수를 표시합니다. 호출자 생략은
@@ -771,8 +780,12 @@ SwiftSyntax와 Objective-C Flutter 핸들러·React Native export 매크로 스�
 등록 채널을 모두 알 때만 `opaque-handler-bodies` 범위를 좁힙니다. 하나라도 모르면 기존
 전체 target 범위를 유지하며, 다른 범위 불명 공백을 덮어쓰지 않습니다.
 
-Swift 브리지 이름은 같은 파일의 불변 `let` 별칭과 괄호를 최대 64단계 따라갑니다. 가변 값,
-값을 모르는 가림 선언, 연산자·보간·다른 파일의 값은 dynamic으로 남깁니다.
+Swift 브리지 이름은 같은 파일의 불변 `let` 별칭과 괄호를 최대 64단계 따라가고, 양쪽이
+풀리는 `+` 연결은 합쳐진 리터럴로(한쪽만 풀리면 풀린 쪽이 접두사로) 풉니다. `self.x = 인자`
+처럼 이니셜라이저 인자로만 채워지는 프로퍼티는 `Type(label:)` 호출 지점의 값으로 풀고,
+`call` 을 그대로 넘기는 한 홉 위임(`Task { await handleAsync(call, …) }`)은 등록 채널을
+그대로 계승합니다. 가변 값, 값을 모르는 가림 선언, 다른 연산자·보간, 호출 지점 간 불일치,
+다른 파일의 값은 dynamic으로 남깁니다.
 [상수·Needle·스토리보드 실측](docs/scans/2026-09-analysis-blindspots.md)에 지원 범위와 입력 공백을 정리했습니다.
 
 동적인 Swift 브리지 이름이 최신 인덱스 소스에서 나오면 `bridges`는 제한된 함수 간 값 흐름

@@ -520,6 +520,15 @@ ambiguous in either, the comparison stays unresolved. An unresolved explicit inp
 Git-derived selections and unresolved runtime evidence are incomplete analysis (exit 2). No path
 or consumer is synthesized by unioning the two graphs.
 
+Because impact only walks consumers of the changed set, an edge that disappeared between two
+changed files never shows up in `affected` — both endpoints sit inside the change scope. The
+`scopeDiff` section closes that gap by diffing the subgraph induced on the union of both change
+scopes: `addedSymbols`/`removedSymbols` list declarations that exist in only one snapshot's scope,
+and `addedEdges`/`removedEdges` list edge triples (source, target, kind) that exist in only one
+graph. Edge kinds the other graph's filter could not have contained are not reported, and a filter
+mismatch is called out in `limitations`. Each list is capped by `--limit`; the `*Count` fields and
+`scopeDiff.truncated` keep the uncapped truth.
+
 Nested runtime review evidence and contract ID lists also obey the output limit. Omitted entries
 carry `externalEvidenceCount`/`externalEvidenceOmitted` or
 `runtimeContractsCount`/`runtimeContractsOmitted`; caller omissions add to the producer's existing
@@ -798,8 +807,12 @@ merely found in unread code. External-object or factory-supplied Swift handlers 
 channel leaves that gap unscoped; unscoped gaps continue to apply to the whole target.
 
 Swift bridge-name resolution follows immutable `let` aliases and parentheses within one file
-(up to 64 steps). Mutable strings, unknown shadowing bindings, operators, interpolation and cross-file values
-remain dynamic. See the [constant/Needle/storyboard checks](docs/scans/2026-09-analysis-blindspots.md).
+(up to 64 steps), joins `+` concatenation when both sides resolve (a resolved head alone stays
+as the name's prefix), resolves a property only ever assigned its initializer's parameter
+(`self.x = arg`) through `Type(label:)` call sites, and attributes a handler's `call`-unchanged
+one-hop forward (`Task { await handleAsync(call, …) }`) to the registered channel. Mutable
+strings, unknown shadowing bindings, other operators, interpolation, disagreeing call sites and
+cross-file values remain dynamic. See the [constant/Needle/storyboard checks](docs/scans/2026-09-analysis-blindspots.md).
 
 When a dynamic Swift name comes from a fresh indexed source, `bridges` also runs the bounded
 interprocedural value-flow analysis and applies a name only when every analyzed context agrees on

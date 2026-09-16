@@ -232,8 +232,61 @@ final class BindingCollector: SyntaxVisitor {
     private(set) var delegateRegistrations: [(typeName: String, channel: ExprSyntax, scopes: [Int], enclosingTypes: [String])] = []
     /// 이 파일이 선언한 타입의 점으로 이은 전체 이름(`A.Plugin`).
     private(set) var declaredTypeChains: Set<String> = []
-    private var functionCounts: [String: Int] = [:]
+    /// 함수 키별 선언 수. 오버로드가 있으면 어느 선언인지 구분할 수 없어 위임 귀속을 멈춘다.
+    private(set) var functionCounts: [String: Int] = [:]
     private var readableHandlers: Set<String> = []
+    /// `FlutterMethodCall` 을 받는 함수의 키 → 인덱스 이름과 선언 타입 사슬.
+    ///
+    /// `call` 을 그대로 넘기는 한 홉 위임에서 호출자의 등록 채널을 풀 때 쓴다. 같은 이름에
+    /// 오버로드가 있으면 마지막 것이 남으므로 쓰는 쪽에서 `functionCounts == 1` 을 확인한다.
+    private(set) var methodCallFunctions: [String: (indexName: String, typeChain: String)] = [:]
+    /// `FlutterMethodCall` 함수 키 → 그 인자의 본문 이름(`handle(_ call:)` 이면 `call`).
+    private(set) var methodCallParams: [String: String] = [:]
+    /// `FlutterMethodCall` 함수 키 → 그 인자의 위치와 외부 레이블. 위임 호출이
+    /// `call` 을 정확히 그 자리에 넘기는지 2차 패스에서 대조한다.
+    private(set) var methodCallSeats: [String: (index: Int, label: String)] = [:]
+    /// `call` 을 넘기는 호출로 기록된 한 홉 위임 후보. 피호출 키 → 호출 지점들.
+    ///
+    /// `handle` 이 `Task { await handleAsync(call, result: r) }` 만 하는 모양이다.
+    /// `call` 이 어느 인자 자리로 갔는지 함께 남겨, 피호출 함수의 `FlutterMethodCall`
+    /// 인자 위치와 다른 자리로 간 호출은 2차 패스에서 걸러 낸다.
+    /// 호출자가 아직 등록 채널로 확인되지 않아도 기록하고, 채널 판정은 2차 패스가 한다.
+    private(set) var forwardedCalls: [String: [ForwardingCall]] = [:]
+    /// `init` 안의 `self.x = 인자` 로만 채워지는 프로퍼티. `Type.x` → 호출 지점의 외부 레이블들.
+    private(set) var initParamLabels: [String: Set<String>] = [:]
+    /// 인자 아닌 값이나 `init` 밖 대입이 한 번이라도 온 프로퍼티는 주입이 아니다.
+    private var nonInjectedProperties: Set<String> = []
+    /// `peer.x = v` 처럼 `self` 아닌 수신자에 대입된 프로퍼티 이름. 수신자 타입을
+    /// 모르니 같은 이름의 주입 추론은 전부 무효로 둔다 — 놓치는 쪽이 안전하다.
+    private var nonInjectedNames: Set<String> = []
+    /// `Type(…)`·`Type.init(…)`·`self.init(…)` 생성자 호출과 그 인자들.
+    /// 주입 프로퍼티의 값을 호출 지점에서 푼다. 레이블 없는 호출도 남겨, 주입
+    /// 레이블을 쓰지 않는 호출 지점이 있으면 증명이 무산되게 한다.
+    private(set) var constructorCalls: [ConstructorCall] = []
+    /// 위임 호출 지점 하나. `call` 이 넘어간 인자의 위치와 레이블을 남긴다.
+    struct ForwardingCall {
+        let caller: String
+        let position: Int
+        let label: String?
+    }
+    /// 생성자 호출 지점 하나. 레이블이 없는 인자는 `nil` 레이블로 남는다.
+    struct ConstructorCall {
+        let typeName: String
+        let arguments: [(label: String?, expression: ExprSyntax)]
+        let scopes: [Int]
+        let enclosingTypes: [String]
+    }
+    /// `aᵢ = aᵢ₋₁ + aᵢ₋₁` 처럼 갈라지는 별칭 사슬에서 같은 바인딩 표현식을 다시
+    /// 풀지 않기 위한 메모. 바인딩이 표현식을 선언 문맥과 함께 저장하므로 같은
+    /// 노드면 같은 문맥이다.
+    private var constantMemo: [SyntaxIdentifier: ResolvedName?] = [:]
+    /// 지금 안에 있는 함수의 키. 지역 함수는 nil — 인덱스 정점이 없어 핸들러가 아니다.
+    private var functionKeys: [String?] = []
+    /// `functionKeys` 와 나란한, 그 함수가 여는 스코프의 `scopes` 안 위치.
+    /// 본문 안 클로저가 `call` 같은 이름을 다시 선언했는지 잡는 데 쓴다.
+    private var functionScopeIndices: [Int] = []
+    /// 안쪽 이니셜라이저의 `본문 이름 → 외부 레이블`. `init` 안의 `self.x = 인자` 판별에 쓴다.
+    private var initParamStack: [[String: String]] = []
 
     /// 지금 어느 타입 안에 있는지.
     private var typeNames: [String] = []
@@ -252,21 +305,44 @@ final class BindingCollector: SyntaxVisitor {
     // MARK: 스코프 문맥
 
     override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
+        var key: String? = nil
         if !DeclarationCollector.isInsideBody(node) {
-            let key = Self.handlerKey(DeclarationCollector.unescaped(node.name.text), enclosingTypes: typeNames)
-            functionCounts[key, default: 0] += 1
-            if node.body != nil && BindingCollector.takesMethodCall(node) { readableHandlers.insert(key) }
+            let handlerKey = Self.handlerKey(DeclarationCollector.unescaped(node.name.text), enclosingTypes: typeNames)
+            functionCounts[handlerKey, default: 0] += 1
+            if node.body != nil && Self.takesMethodCall(node) {
+                readableHandlers.insert(handlerKey)
+                methodCallFunctions[handlerKey] = (
+                    indexName: RuntimeSyntaxNames.indexName(node.name.text, parameters: node.signature.parameterClause.parameters),
+                    typeChain: typeNames.joined(separator: ".")
+                )
+                let parameters = node.signature.parameterClause.parameters
+                if let found = parameters.firstIndex(where: Self.isMethodCallParameter) {
+                    let parameter = parameters[found]
+                    let internalName = DeclarationCollector.unescaped((parameter.secondName ?? parameter.firstName).text)
+                    if internalName != "_" { methodCallParams[handlerKey] = internalName }
+                    let index = parameters.distance(from: parameters.startIndex, to: found)
+                    methodCallSeats[handlerKey] = (index, DeclarationCollector.unescaped(parameter.firstName.text))
+                }
+            }
+            key = handlerKey
         }
+        functionKeys.append(key)
+        functionScopeIndices.append(scopes.count)
         return pushScope(node)
     }
-    override func visitPost(_ node: FunctionDeclSyntax) { scopes.removeLast() }
-    override func visit(_ node: InitializerDeclSyntax) -> SyntaxVisitorContinueKind { pushScope(node) }
-    override func visitPost(_ node: InitializerDeclSyntax) { scopes.removeLast() }
+    override func visitPost(_: FunctionDeclSyntax) {
+        scopes.removeLast(); functionKeys.removeLast(); functionScopeIndices.removeLast()
+    }
+    override func visit(_ node: InitializerDeclSyntax) -> SyntaxVisitorContinueKind {
+        initParamStack.append(Self.initParamLabels(of: node))
+        return pushScope(node)
+    }
+    override func visitPost(_: InitializerDeclSyntax) { scopes.removeLast(); initParamStack.removeLast() }
     override func visit(_ node: ClosureExprSyntax) -> SyntaxVisitorContinueKind { pushScope(node) }
-    override func visitPost(_ node: ClosureExprSyntax) { scopes.removeLast() }
+    override func visitPost(_: ClosureExprSyntax) { scopes.removeLast() }
 
     override func visit(_ node: AccessorBlockSyntax) -> SyntaxVisitorContinueKind { pushScope(node) }
-    override func visitPost(_ node: AccessorBlockSyntax) { scopes.removeLast() }
+    override func visitPost(_: AccessorBlockSyntax) { scopes.removeLast() }
     override func visit(_ node: AccessorDeclSyntax) -> SyntaxVisitorContinueKind {
         _ = pushScope(node)
         let kind = node.accessorSpecifier.text
@@ -275,7 +351,7 @@ final class BindingCollector: SyntaxVisitor {
         else if kind == "didSet" { shadow("oldValue", isLocal: true) }
         return .visitChildren
     }
-    override func visitPost(_ node: AccessorDeclSyntax) { scopes.removeLast() }
+    override func visitPost(_: AccessorDeclSyntax) { scopes.removeLast() }
 
     private func pushScope(_ node: some SyntaxProtocol) -> SyntaxVisitorContinueKind {
         scopes.append(Self.scopeKey(node)); return .visitChildren
@@ -283,6 +359,17 @@ final class BindingCollector: SyntaxVisitor {
 
     /// 함수·클로저를 구분하는 키. 두 패스가 같은 트리를 걸으므로 같은 노드에서 같은 값이다.
     static func scopeKey(_ node: some SyntaxProtocol) -> Int { node.position.utf8Offset }
+
+    /// `init(global: g)` 의 본문 이름 `g` → 호출 지점 레이블 `global`.
+    /// `init(_ x:)` 처럼 레이블이 없는 인자는 호출 지점에서 이름이 없어 못 따라간다.
+    private static func initParamLabels(of node: InitializerDeclSyntax) -> [String: String] {
+        var labels: [String: String] = [:]
+        for parameter in node.signature.parameterClause.parameters where parameter.firstName.text != "_" {
+            labels[DeclarationCollector.unescaped((parameter.secondName ?? parameter.firstName).text)] =
+                DeclarationCollector.unescaped(parameter.firstName.text)
+        }
+        return labels
+    }
 
     // MARK: 타입 문맥
 
@@ -292,17 +379,17 @@ final class BindingCollector: SyntaxVisitor {
         }
         return pushType(node.name.text)
     }
-    override func visitPost(_ node: ClassDeclSyntax) { typeNames.removeLast() }
+    override func visitPost(_: ClassDeclSyntax) { typeNames.removeLast() }
     override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind { pushType(node.name.text) }
-    override func visitPost(_ node: StructDeclSyntax) { typeNames.removeLast() }
+    override func visitPost(_: StructDeclSyntax) { typeNames.removeLast() }
     override func visit(_ node: EnumDeclSyntax) -> SyntaxVisitorContinueKind { pushType(node.name.text) }
-    override func visitPost(_ node: EnumDeclSyntax) { typeNames.removeLast() }
+    override func visitPost(_: EnumDeclSyntax) { typeNames.removeLast() }
     override func visit(_ node: ActorDeclSyntax) -> SyntaxVisitorContinueKind { pushType(node.name.text) }
-    override func visitPost(_ node: ActorDeclSyntax) { typeNames.removeLast() }
+    override func visitPost(_: ActorDeclSyntax) { typeNames.removeLast() }
     override func visit(_ node: ExtensionDeclSyntax) -> SyntaxVisitorContinueKind {
         pushType(node.extendedType.trimmedDescription)
     }
-    override func visitPost(_ node: ExtensionDeclSyntax) { typeNames.removeLast() }
+    override func visitPost(_: ExtensionDeclSyntax) { typeNames.removeLast() }
 
     private func pushType(_ name: String) -> SyntaxVisitorContinueKind {
         let unescaped = DeclarationCollector.unescaped(name)
@@ -368,12 +455,34 @@ final class BindingCollector: SyntaxVisitor {
         guard let name = Self.identifierName(of: node.leftOperand) else { return .visitChildren }
         let member = node.leftOperand.as(MemberAccessExprSyntax.self)
         if let member, !["self", "Self"].contains(member.base?.as(DeclReferenceExprSyntax.self)?.baseName.text ?? "") {
+            // `peer.x = v` — 수신자 타입은 모르지만 init 주입으로 본 같은 이름의
+            // 프로퍼티가 초기화 밖에서 대입될 수 있다는 증거이므로 이름째로 무효화한다.
             shadow(name, isLocal: false)
+            nonInjectedNames.insert(name)
             return .visitChildren
         }
         let key = assignmentKey(name, explicitMember: member != nil)
+        noteInjection(key: key, value: node.rightOperand)
         bind(name: name, to: node.rightOperand, isLocal: false, bindingKey: key)
         return .visitChildren
+    }
+
+    /// `init` 안의 `self.x = 인자` 로만 채워지는 프로퍼티를 생성자 주입으로 기록한다.
+    ///
+    /// 지역 키(`#`)는 프로퍼티가 아니다. 인자 아닌 값이나 `init` 밖 대입이 한 번이라도
+    /// 오면 그 프로퍼티는 호출 지점의 값이라고 할 수 없으므로 주입 기록을 지운다.
+    private func noteInjection(key: String, value: ExprSyntax) {
+        guard !key.contains("#") else { return }
+        guard let labels = initParamStack.last,
+              let reference = value.as(DeclReferenceExprSyntax.self),
+              let label = labels[DeclarationCollector.unescaped(reference.baseName.text)]
+        else {
+            initParamLabels.removeValue(forKey: key)
+            nonInjectedProperties.insert(key)
+            return
+        }
+        guard !nonInjectedProperties.contains(key) else { return }
+        initParamLabels[key, default: []].insert(label)
     }
 
     /// 대입은 새 지역 선언이 아니다. 기존 지역·프로퍼티에 합쳐 표기 차이와 클로저 변경을 놓치지 않는다.
@@ -398,7 +507,63 @@ final class BindingCollector: SyntaxVisitor {
         }
         recordHandlerReference(node)
         recordDelegate(node)
+        recordForwarding(node)
+        recordConstructorCall(node)
         return .visitChildren
+    }
+
+    /// 핸들러가 `call` 을 그대로 넘기는 한 홉 위임을 기록한다.
+    ///
+    /// `self.f(…)`·`f(…)` 만 본다 — 다른 수신자의 메서드는 이 파일의 함수가 아니다.
+    /// 호출자의 `FlutterMethodCall` 파라미터가 인자로 그대로 참조돼야 같은 호출의 분기다.
+    private func recordForwarding(_ call: FunctionCallExprSyntax) {
+        guard let caller = functionKeys.last ?? nil,
+              let callParam = methodCallParams[caller],
+              let callee = Self.identifierName(of: call.calledExpression) else { return }
+        if let member = call.calledExpression.as(MemberAccessExprSyntax.self),
+           member.base?.as(DeclReferenceExprSyntax.self)?.baseName.text != "self" { return }
+        // 본문 안 클로저가 `call` 이름을 다시 선언했으면 이 참조는 핸들러의
+        // 인자가 아니라 클로저의 것이다 — 철자만 보고 위임으로 세지 않는다.
+        if let own = functionScopeIndices.last {
+            for scope in scopes.dropFirst(own + 1) where bindings[Self.localKey(callParam, scope: scope)] != nil {
+                return
+            }
+        }
+        // `call` 이 넘어간 자리를 전부 남긴다 — 피호출 함수의 `FlutterMethodCall`
+        // 인자가 어느 자리인지는 선언을 봐야 알고, 대조는 2차 패스가 한다.
+        let seats = call.arguments.enumerated().compactMap { offset, argument -> (Int, String?)? in
+            Self.unparenthesized(argument.expression).as(DeclReferenceExprSyntax.self)?.baseName.text == callParam
+                ? (offset, argument.label?.text) : nil
+        }
+        guard !seats.isEmpty else { return }
+        forwardedCalls[Self.handlerKey(callee, enclosingTypes: typeNames), default: []]
+            .append(contentsOf: seats.map { ForwardingCall(caller: caller, position: $0.0, label: $0.1) })
+    }
+
+    /// `Plugin(label: x)` 형태의 생성자 호출 인자를 기록한다.
+    /// `init` 안의 `self.x = label` 주입 프로퍼티를 이 호출 지점의 값으로 푼다.
+    private func recordConstructorCall(_ call: FunctionCallExprSyntax) {
+        let dotted: String
+        if let member = call.calledExpression.as(MemberAccessExprSyntax.self),
+           member.declName.baseName.text == "init", let base = member.base {
+            if base.as(DeclReferenceExprSyntax.self)?.baseName.text == "self" {
+                // `self.init(…)` 위임 생성자도 같은 타입의 호출 지점이다.
+                dotted = typeNames.joined(separator: ".")
+            } else {
+                // `Plugin.init(c: x)` 처럼 `.init` 을 명시한 호출도 그 타입의 지점이다.
+                // `super.init`·인스턴스의 `.init` 은 마지막 대문자 검사에서 걸러진다.
+                dotted = Self.dottedTypeName(of: base)
+            }
+        } else {
+            dotted = Self.dottedTypeName(of: call.calledExpression)
+        }
+        guard dotted.split(separator: ".").last?.first?.isUppercase == true else { return }
+        constructorCalls.append(ConstructorCall(
+            typeName: dotted,
+            arguments: call.arguments.map { ($0.label?.text, $0.expression) },
+            scopes: scopes,
+            enclosingTypes: typeNames
+        ))
     }
 
     /// `registrar.addMethodCallDelegate(instance, channel: c)` 의 `instance` 가 어느 타입인지 기억한다.
@@ -457,14 +622,20 @@ final class BindingCollector: SyntaxVisitor {
         (enclosingTypes + [name]).joined(separator: ".")
     }
 
+    /// `FlutterMethodCall` 파라미터. `FlutterMethodCall?` 과 `Flutter.FlutterMethodCall` 도 같은 타입이다.
+    static func methodCallParameter(of node: FunctionDeclSyntax) -> FunctionParameterSyntax? {
+        node.signature.parameterClause.parameters.first(where: isMethodCallParameter)
+    }
+
+    /// 파라미터 타입이 `FlutterMethodCall`(`?`·`!`·모듈 수식 포함)인지.
+    private static func isMethodCallParameter(_ parameter: FunctionParameterSyntax) -> Bool {
+        let type = parameter.type.trimmedDescription.trimmingCharacters(in: CharacterSet(charactersIn: "?!"))
+        return type == BridgeChannels.methodCall || type.hasSuffix("." + BridgeChannels.methodCall)
+    }
+
     /// `FlutterMethodCall` 인자를 받는 함수인지. `FlutterPlugin.handle(_:result:)` 가 그렇다.
-    ///
-    /// `FlutterMethodCall?` 과 `Flutter.FlutterMethodCall` 도 같은 타입이다.
     static func takesMethodCall(_ node: FunctionDeclSyntax) -> Bool {
-        node.signature.parameterClause.parameters.contains {
-            let type = $0.type.trimmedDescription.trimmingCharacters(in: CharacterSet(charactersIn: "?!"))
-            return type == BridgeChannels.methodCall || type.hasSuffix("." + BridgeChannels.methodCall)
-        }
+        methodCallParameter(of: node) != nil
     }
 
     /// 저장된 클로저·외부 함수·오버로드를 파일 안의 확정된 함수 본문으로 오인하지 않는다.
@@ -572,9 +743,63 @@ final class BindingCollector: SyntaxVisitor {
 
     /// 채널 변수의 이름과 생성자 종류를 함께 푼다.
     func channelDetails(named name: String, in context: Context) -> (name: ResolvedName, kind: BridgeChannelKind)?? {
-        guard let found = binding(named: name, in: context, membersOnly: false) else { return nil }
-        guard case let .channel(argument, scopes, types, kind)? = found else { return .some(nil) }
-        return .some((resolveString(argument, in: Context(scopes: scopes, enclosingTypes: types)), kind))
+        channelDetails(named: name, in: context, depth: 0)
+    }
+
+    private func channelDetails(named name: String, in context: Context, depth: Int) -> (name: ResolvedName, kind: BridgeChannelKind)?? {
+        // 지역 스코프에서 먼저 잡히면 그 이름은 지역 값이다 — 같은 이름의 주입
+        // 프로퍼티 채널이 지역 파라미터로 새어 나오지 않게 멤버 단계를 타지 않는다.
+        for scope in context.scopes.reversed() {
+            guard let found = bindings[Self.localKey(name, scope: scope)] else { continue }
+            return .some(channelValue(found))
+        }
+        for end in stride(from: context.enclosingTypes.count, through: 0, by: -1) {
+            let key = (context.enclosingTypes.prefix(end) + [name]).joined(separator: ".")
+            guard let found = bindings[key] else { continue }
+            if let details = channelValue(found) { return .some(details) }
+            if let injected = injectedChannel(key: key, depth: depth) { return .some(injected) }
+            return .some(nil)
+        }
+        return nil
+    }
+
+    /// 바인딩이 채널 생성자면 푼 이름과 종류. 다른 값이거나 모르면 nil.
+    private func channelValue(_ found: BoundValue?) -> (name: ResolvedName, kind: BridgeChannelKind)? {
+        guard case let .channel(argument, scopes, types, kind)? = found else { return nil }
+        return (resolveString(argument, in: Context(scopes: scopes, enclosingTypes: types)), kind)
+    }
+
+    /// `init` 안에서 `self.name = 인자` 로만 채워지는 프로퍼티 `key`(`A.B.name`)의
+    /// 채널을 생성자 호출 지점에서 푼다.
+    ///
+    /// 그 타입의 호출 지점이 하나라도 주입 레이블을 쓰지 않거나(`Plugin()`,
+    /// `Plugin(other:)` — 다른 이니셜라이저가 다른 값을 넣는 경로), 지점마다
+    /// 값이 다르면 모른다.
+    private func injectedChannel(key: String, depth: Int) -> (name: ResolvedName, kind: BridgeChannelKind)? {
+        guard depth < 4,
+              let dot = key.lastIndex(of: "."),
+              let labels = initParamLabels[key] else { return nil }
+        let chain = String(key[..<dot])
+        let name = String(key[key.index(after: dot)...])
+        guard !nonInjectedNames.contains(name) else { return nil }
+        var resolved: [(name: ResolvedName, kind: BridgeChannelKind)] = []
+        for call in constructorCalls
+        where resolveTypeChain(call.typeName, from: call.enclosingTypes) == chain {
+            guard let argument = call.arguments.first(where: { $0.label != nil && labels.contains($0.label!) })
+            else { return nil }
+            let callContext = Context(scopes: call.scopes, enclosingTypes: call.enclosingTypes)
+            if let inline = channelConstruction(argument.expression, in: callContext) {
+                resolved.append(inline)
+            } else if let reference = Self.identifierName(of: argument.expression),
+                      let details = channelDetails(named: reference, in: callContext, depth: depth + 1), let details {
+                resolved.append(details)
+            } else {
+                return nil
+            }
+        }
+        guard let first = resolved.first,
+              resolved.allSatisfy({ $0.name == first.name && $0.kind == first.kind }) else { return nil }
+        return first
     }
 
     /// 파일 안의 메서드 채널 생성 전부를 이름으로 푼 것. 핸들러 문맥 밖의 추측에 쓴다.
@@ -629,7 +854,8 @@ final class BindingCollector: SyntaxVisitor {
         return .dynamic(expression.trimmedDescription)
     }
 
-    /// 순환·지나치게 긴 별칭은 중단한다. 연산자 오버로드와 함수 호출 결과는 평가하지 않는다.
+    /// 순환·지나치게 긴 별칭은 중단한다. 문자열 `+` 연결 외의 연산자와 함수 호출 결과는
+    /// 평가하지 않는다.
     private func constantString(_ expression: ExprSyntax, in context: Context, remaining: Int) -> ResolvedName? {
         guard remaining > 0 else { return nil }
         let expression = Self.unparenthesized(expression)
@@ -639,8 +865,30 @@ final class BindingCollector: SyntaxVisitor {
                 .dynamic(literal.trimmedDescription, channelPrefix: $0)
             }
         }
+        // `base + "/events"` — 앞쪽이 풀렸으면 그 값이 실행 시 접두사이고, 뒤쪽까지
+        // 리터럴이면 합친 값이 리터럴이다. `.literal` 은 문자열 리터럴에서만 나오므로
+        // 오버로드된 다른 타입의 `+` 는 여기 오지 않는다.
+        if let infix = expression.as(InfixOperatorExprSyntax.self),
+           let operation = infix.operator.as(BinaryOperatorExprSyntax.self), operation.operator.text == "+",
+           let left = constantString(infix.leftOperand, in: context, remaining: remaining - 1) {
+            if !left.isDynamic,
+               let right = constantString(infix.rightOperand, in: context, remaining: remaining - 1), !right.isDynamic {
+                // 증명 가능해도 채널 이름이 될 수 없는 크기는 만들지 않는다 —
+                // `aᵢ = aᵢ₋₁ + aᵢ₋₁` 사슬은 결과가 2ⁿ 배로 커진다.
+                guard left.text.count + right.text.count <= 4096 else { return nil }
+                return .literal(left.text + right.text)
+            }
+            if let prefix = left.isDynamic ? left.channelPrefix : left.text {
+                return .dynamic(expression.trimmedDescription, channelPrefix: prefix)
+            }
+        }
         guard case let .constant(value, scopes, types)?? = constantBinding(for: expression, in: context) else { return nil }
-        return constantString(value, in: Context(scopes: scopes, enclosingTypes: types), remaining: remaining - 1)
+        // 같은 바인딩 표현식을 두 번째 풀 때는 저장된 답을 쓴다 — 별칭이 갈라지는
+        // 사슬에서 메모가 없으면 재귀가 지수로 불어난다.
+        if let memoized = constantMemo[value.id] { return memoized }
+        let resolved = constantString(value, in: Context(scopes: scopes, enclosingTypes: types), remaining: remaining - 1)
+        constantMemo[value.id] = resolved
+        return resolved
     }
 
     /// 보간 문자열의 첫 리터럴 세그먼트를 실행 시 문자열 값으로 디코드한다.
@@ -763,23 +1011,23 @@ final class BridgeFactCollector: SyntaxVisitor {
         }
         return .visitChildren
     }
-    override func visitPost(_ node: ClassDeclSyntax) { popType(); reactModules.removeLast() }
+    override func visitPost(_: ClassDeclSyntax) { popType(); reactModules.removeLast() }
 
     // 중첩 타입은 바깥 클래스의 Objective-C 노출을 물려받지 않는다.
     override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind {
         pushType(node.name.text, node: node); reactModules.append(nil); return .visitChildren
     }
-    override func visitPost(_ node: StructDeclSyntax) { popType(); reactModules.removeLast() }
+    override func visitPost(_: StructDeclSyntax) { popType(); reactModules.removeLast() }
 
     override func visit(_ node: EnumDeclSyntax) -> SyntaxVisitorContinueKind {
         pushType(node.name.text, node: node); reactModules.append(nil); return .visitChildren
     }
-    override func visitPost(_ node: EnumDeclSyntax) { popType(); reactModules.removeLast() }
+    override func visitPost(_: EnumDeclSyntax) { popType(); reactModules.removeLast() }
 
     override func visit(_ node: ActorDeclSyntax) -> SyntaxVisitorContinueKind {
         pushType(node.name.text, node: node); reactModules.append(nil); return .visitChildren
     }
-    override func visitPost(_ node: ActorDeclSyntax) { popType(); reactModules.removeLast() }
+    override func visitPost(_: ActorDeclSyntax) { popType(); reactModules.removeLast() }
 
     /// `@objc(Name)` 클래스의 익스텐션에 둔 `@objc` 메서드도 JS 에 보인다.
     override func visit(_ node: ExtensionDeclSyntax) -> SyntaxVisitorContinueKind {
@@ -792,7 +1040,7 @@ final class BridgeFactCollector: SyntaxVisitor {
         reactModules.append(module)
         return .visitChildren
     }
-    override func visitPost(_ node: ExtensionDeclSyntax) { popType(); reactModules.removeLast() }
+    override func visitPost(_: ExtensionDeclSyntax) { popType(); reactModules.removeLast() }
 
     override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
         // 스코프는 지역 함수에도 쌓는다. 1차 패스와 같은 키여야 지역 상수가 맞는다.
@@ -820,30 +1068,69 @@ final class BridgeFactCollector: SyntaxVisitor {
 
     /// 이 함수가 어느 채널의 핸들러인지, 등록 호출이 말해 준 것.
     ///
-    /// 둘 중 하나다. `setMethodCallHandler(handleCall)` 로 메서드 참조가 넘겨졌거나,
+    /// 셋 중 하나다. `setMethodCallHandler(handleCall)` 로 메서드 참조가 넘겨졌거나,
     /// 이 함수가 `addMethodCallDelegate(instance, channel:)` 로 등록된 타입의
-    /// `handle(_:result:)` 이거나. 둘 다 추측이 아니다.
+    /// `handle(_:result:)` 이거나, 그런 핸들러가 `call` 을 그대로 넘기는 한 홉
+    /// 위임의 대상이거나. 모두 추측이 아니다.
     private func referencedHandlerChannel(of node: FunctionDeclSyntax) -> ResolvedName?? {
         // 메서드 참조든 델리게이트든, 핸들러는 FlutterMethodCall 을 받는 함수다. 아니면 동명의
         // 무관한 함수라 `request.method == "DELETE"` 가 이 채널의 사실로 나간다.
         guard BindingCollector.takesMethodCall(node) else { return nil }
         let name = DeclarationCollector.unescaped(node.name.text)
-        if let entries = bindings.handlerFunctions[BindingCollector.handlerKey(name, enclosingTypes: typeNames)] {
+        let key = BindingCollector.handlerKey(name, enclosingTypes: typeNames)
+        if let entries = bindings.handlerFunctions[key] {
             return .some(Self.single(entries.compactMap {
                 resolveChannel($0.receiver, in: .init(scopes: $0.scopes, enclosingTypes: $0.enclosingTypes))?.name
             }))
         }
         // FlutterPlugin 이 요구하는 것은 정확히 `handle(_:result:)` 다. 다른 오버로드는 아니다.
-        let indexName = Self.indexName(name, parameters: node.signature.parameterClause.parameters)
-        guard indexName == "handle(_:result:)" else { return nil }
-        let chain = typeNames.joined(separator: ".")
-        let registrations = bindings.delegateRegistrations.filter {
-            bindings.resolveTypeChain($0.typeName, from: $0.enclosingTypes) == chain
+        if Self.indexName(name, parameters: node.signature.parameterClause.parameters) == "handle(_:result:)" {
+            let chain = typeNames.joined(separator: ".")
+            let registrations = bindings.delegateRegistrations.filter {
+                bindings.resolveTypeChain($0.typeName, from: $0.enclosingTypes) == chain
+            }
+            if !registrations.isEmpty {
+                return .some(Self.single(registrations.compactMap {
+                    resolveChannel($0.channel, in: .init(scopes: $0.scopes, enclosingTypes: $0.enclosingTypes))?.name
+                }))
+            }
         }
-        guard !registrations.isEmpty else { return nil }
-        return .some(Self.single(registrations.compactMap {
-            resolveChannel($0.channel, in: .init(scopes: $0.scopes, enclosingTypes: $0.enclosingTypes))?.name
-        }))
+        // `handle` → `handleAsync` 처럼 `call` 을 그대로 넘기는 한 홉 위임. 기록된 한 단계만
+        // 보며 호출 그래프를 재귀로 쫓지 않는다. 같은 이름에 선언이 여럿이면 어느 것이
+        // 호출자인지 몰라 귀속하지 않는다.
+        guard bindings.functionCounts[key] == 1,
+              let seat = bindings.methodCallSeats[key],
+              let calls = bindings.forwardedCalls[key], !calls.isEmpty else { return nil }
+        // `call` 이 이 함수의 `FlutterMethodCall` 자리와 다른 위치·레이블로 넘어간
+        // 호출은 위임이 아니다 — 그 자리의 인자가 분기 대상이어야 같은 호출이다.
+        let callers = Set(calls.compactMap { entry -> String? in
+            let labelMatches = entry.label == nil ? seat.label == "_" : entry.label == seat.label
+            return labelMatches && entry.position == seat.index ? entry.caller : nil
+        })
+        guard !callers.isEmpty else { return nil }
+        let proven = callers.sorted().compactMap {
+            bindings.functionCounts[$0] == 1 ? recordedChannel(of: $0) : nil
+        }
+        guard !proven.isEmpty else { return nil }
+        // 호출자마다 증명된 채널이 있고 전부 같을 때만 계승한다.
+        return .some(proven.count == callers.count ? Self.single(proven) : nil)
+    }
+
+    /// 등록 호출이 `key` 함수에 물어 준 채널. 메서드 참조와 델리게이트 등록 둘 다 본다.
+    ///
+    /// 근거가 없으면 nil, 있으면 푼 채널이 전부 같을 때만 그 채널이다.
+    private func recordedChannel(of key: String) -> ResolvedName? {
+        var channels = (bindings.handlerFunctions[key] ?? []).compactMap {
+            resolveChannel($0.receiver, in: .init(scopes: $0.scopes, enclosingTypes: $0.enclosingTypes))?.name
+        }
+        if let function = bindings.methodCallFunctions[key], function.indexName == "handle(_:result:)" {
+            channels += bindings.delegateRegistrations.filter {
+                bindings.resolveTypeChain($0.typeName, from: $0.enclosingTypes) == function.typeChain
+            }.compactMap {
+                resolveChannel($0.channel, in: .init(scopes: $0.scopes, enclosingTypes: $0.enclosingTypes))?.name
+            }
+        }
+        return channels.isEmpty ? nil : Self.single(channels)
     }
 
     /// 등록이 여럿이면 푼 채널 이름이 전부 같을 때만 그 채널이다. 다르면 모른다.
@@ -857,16 +1144,16 @@ final class BridgeFactCollector: SyntaxVisitor {
     override func visit(_ node: AccessorBlockSyntax) -> SyntaxVisitorContinueKind {
         scopes.append(BindingCollector.scopeKey(node)); aliasScopes.append([]); return .visitChildren
     }
-    override func visitPost(_ node: AccessorBlockSyntax) { scopes.removeLast(); aliasScopes.removeLast() }
+    override func visitPost(_: AccessorBlockSyntax) { scopes.removeLast(); aliasScopes.removeLast() }
     override func visit(_ node: AccessorDeclSyntax) -> SyntaxVisitorContinueKind {
         scopes.append(BindingCollector.scopeKey(node)); aliasScopes.append([]); return .visitChildren
     }
-    override func visitPost(_ node: AccessorDeclSyntax) { scopes.removeLast(); aliasScopes.removeLast() }
+    override func visitPost(_: AccessorDeclSyntax) { scopes.removeLast(); aliasScopes.removeLast() }
 
     override func visit(_ node: ClosureExprSyntax) -> SyntaxVisitorContinueKind {
         scopes.append(BindingCollector.scopeKey(node)); aliasScopes.append([]); return .visitChildren
     }
-    override func visitPost(_ node: ClosureExprSyntax) { scopes.removeLast(); aliasScopes.removeLast() }
+    override func visitPost(_: ClosureExprSyntax) { scopes.removeLast(); aliasScopes.removeLast() }
 
     override func visit(_ node: InitializerDeclSyntax) -> SyntaxVisitorContinueKind {
         pushDeclaration(
@@ -877,7 +1164,7 @@ final class BridgeFactCollector: SyntaxVisitor {
         scopes.append(BindingCollector.scopeKey(node)); aliasScopes.append([])
         return .visitChildren
     }
-    override func visitPost(_ node: InitializerDeclSyntax) {
+    override func visitPost(_: InitializerDeclSyntax) {
         declarations.removeLast(); scopes.removeLast(); aliasScopes.removeLast()
     }
 
@@ -910,8 +1197,7 @@ final class BridgeFactCollector: SyntaxVisitor {
 
     /// 인덱스가 붙이는 이름. `handle(_:result:)`, `init(messenger:)`.
     static func indexName(_ base: String, parameters: FunctionParameterListSyntax) -> String {
-        DeclarationCollector.unescaped(base) + "("
-            + parameters.map { DeclarationCollector.unescaped($0.firstName.text) + ":" }.joined() + ")"
+        RuntimeSyntaxNames.indexName(base, parameters: parameters)
     }
 
     // MARK: Flutter
