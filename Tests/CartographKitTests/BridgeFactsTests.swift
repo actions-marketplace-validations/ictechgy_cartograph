@@ -522,6 +522,25 @@ struct BridgeFactsTests {
         #expect(String(decoding: data, as: UTF8.self).contains("\"sourceLanguage\":\"objective-c\""))
     }
 
+    @Test("FFI·Dart C API 표식은 채널 사실이 아니라 파일 수준 한계로 센다")
+    func ffiInteropEvidenceBecomesFileLevelLimitation() throws {
+        let swift = """
+            @_cdecl("dart_native_add")
+            func dartNativeAdd(_ a: Int32, _ b: Int32) -> Int32 { a + b }
+            """
+        let objc = "#import <dart_native_api.h>\nvoid forward(Dart_Port port) { Dart_PostCObject(port, nullptr); }\n"
+        let plain = "struct Plain { let value = 1 }\n"
+        let document = try makeService(
+            files: ["/p/Native.swift": swift, "/p/Forward.m": objc, "/p/Plain.swift": plain],
+            snapshot: IndexSnapshot()
+        ).bridgeFacts()
+        #expect(document.limitations.contains { $0.hasPrefix("unscanned-ffi-interop: 2") })
+        // 표식 없는 파일은 세지 않고, 채널 사실과 섞이지 않는다.
+        #expect(!document.limitations.contains { $0.hasPrefix("unscanned-ffi-interop: 3") })
+        let clean = try makeService(files: ["/p/Plain.swift": plain], snapshot: IndexSnapshot()).bridgeFacts()
+        #expect(!clean.limitations.contains { $0.hasPrefix("unscanned-ffi-interop:") })
+    }
+
     @Test("저장된 클로저와 파일 밖 함수도 본문을 못 읽으면 채널 공백을 낸다")
     func scopesStoredClosureAndUnknownFunction() throws {
         for argument in ["handler", "fromSDK"] {
@@ -893,7 +912,8 @@ struct BridgeFactsTests {
         #expect(messageDocument.platform == "swift")
         #expect(messageDocument.facts.map(\.kind) == ["message-handle"])
         #expect(messageDocument.facts.first?.method == nil)
-        #expect(!messageDocument.limitations.contains { $0.hasPrefix("unscanned-message-channels:") })
+        // 전송별 문서도 자신의 관측 공백을 싣는다 — 없다와 못 봤다를 소비자가 구분한다.
+        #expect(messageDocument.limitations.contains { $0.hasPrefix("unscanned-message-channels: 1") })
         let json = try service.exportBridgeFacts(
             generatedAt: fixedDate, target: .flutter, messages: true
         ).output
@@ -1098,6 +1118,97 @@ struct BridgeFactsTests {
         let dependencies = try #require(basic["dependencies"] as? [[String: Any]])
         #expect(dependencies.contains { ($0["symbol"] as? [String: Any])?["usr"] as? String == "s:helper" })
         #expect(!dependencies.contains { ($0["symbol"] as? [String: Any])?["usr"] as? String == "s:runtime" })
+    }
+
+    @Test("case 본문의 참조는 그 메서드의 핸들러 의존으로만 귀속된다")
+    func methodBranchScopesIsolateCaseDependencies() throws {
+        let source = """
+            let channel = FlutterMethodChannel(name: "c", binaryMessenger: m)
+            class P {
+                func handle(_ call: FlutterMethodCall, result: FlutterResult) {
+                    switch call.method {
+                    case "a":
+                        result(helperA())
+                    case "b":
+                        result(helperB())
+                    default: break
+                    }
+                }
+            }
+            """
+        let scanned = BridgeFactScanner().scan(source: source, path: "/tmp/m.swift")
+        let a = try #require(scanned.facts.first { $0.fact.method == "a" }?.fact.handlerScope)
+        let b = try #require(scanned.facts.first { $0.fact.method == "b" }?.fact.handlerScope)
+        let snapshot = IndexSnapshot(symbols: [
+            IndexedSymbol(usr: "s:handle", name: "handle(_:result:)", kind: .method, module: "P",
+                location: .init(path: "/tmp/m.swift", line: 3, column: 10)),
+            IndexedSymbol(usr: "s:a", name: "helperA()", kind: .function, module: "P",
+                location: .init(path: "/tmp/m.swift", line: 20, column: 1)),
+            IndexedSymbol(usr: "s:b", name: "helperB()", kind: .function, module: "P",
+                location: .init(path: "/tmp/m.swift", line: 21, column: 1)),
+            IndexedSymbol(usr: "s:shared", name: "shared()", kind: .function, module: "P",
+                location: .init(path: "/tmp/m.swift", line: 22, column: 1)),
+        ], references: [
+            // 절 본문 안의 호출은 그 메서드의 근거, switch 머리의 호출은 공통 등록 근거다.
+            IndexedReference(sourceUSR: "s:handle", targetUSR: "s:a", kind: .call,
+                location: .init(path: a.start.path, line: a.start.line + 1, column: 9)),
+            IndexedReference(sourceUSR: "s:handle", targetUSR: "s:b", kind: .call,
+                location: .init(path: b.start.path, line: b.start.line + 1, column: 9)),
+            IndexedReference(sourceUSR: "s:handle", targetUSR: "s:shared", kind: .call,
+                location: .init(path: "/tmp/m.swift", line: 4, column: 9)),
+        ])
+        let resolved = BridgeSymbolResolver(snapshot: snapshot, freshPaths: ["/tmp/m.swift"])
+            .resolve(scanned.facts, handlerScopes: scanned.handlerScopes)
+        let factA = try #require(resolved.first { $0.method == "a" })
+        let factB = try #require(resolved.first { $0.method == "b" })
+        #expect(factA.handlerScope?.complete == true)
+        #expect(factB.handlerScope?.complete == true)
+        #expect(factA.dependencies?.filter { $0.scope == .handler }.map(\.symbol.usr) == ["s:a"])
+        #expect(factB.dependencies?.filter { $0.scope == .handler }.map(\.symbol.usr) == ["s:b"])
+        #expect(factA.dependencies?.filter { $0.scope == .registration }.map(\.symbol.usr) == ["s:shared"])
+        #expect(factB.dependencies?.filter { $0.scope == .registration }.map(\.symbol.usr) == ["s:shared"])
+    }
+
+    @Test("--events 문서는 stream-handle 사실만 v2 event-channel로 낸다")
+    func eventsDocumentCarriesOnlyStreamHandles() throws {
+        let service = makeService(files: ["/p/A.swift": """
+            class P {
+                static func register(messenger: FlutterBinaryMessenger) {
+                    let events = FlutterEventChannel(name: "com.example/charging", binaryMessenger: messenger)
+                    events.setStreamHandler(BatteryPlusChargingHandler())
+                    let channel = FlutterMethodChannel(name: "com.example/battery", binaryMessenger: messenger)
+                    channel.setMethodCallHandler { call, result in
+                        switch call.method { case "getBatteryLevel": result(1) default: break }
+                    }
+                }
+            }
+            """], snapshot: IndexSnapshot())
+        let document = try service.bridgeFacts(events: true)
+        #expect(document.version == BridgeFactsDocument.messageVersion)
+        #expect(document.transport == "event-channel")
+        #expect(document.facts.map(\.kind) == ["stream-handle"])
+        #expect(document.facts.first?.channel == "com.example/charging")
+        #expect(document.facts.first?.method == nil)
+    }
+
+    @Test("events 문서도 자신의 관측 공백을 싣는다")
+    func eventsDocumentCarriesCoverageCounts() throws {
+        let service = makeService(files: [
+            "/p/A.swift": "let events = FlutterEventChannel(name: \"e\", binaryMessenger: m)\n",
+            "/p/Native.m": "void forward(void) {}\n",
+        ], snapshot: IndexSnapshot())
+        let document = try service.bridgeFacts(generatedAt: fixedDate, events: true)
+        #expect(document.transport == "event-channel")
+        #expect(document.limitations.contains { $0.hasPrefix("unscanned-event-channels: 1") })
+        #expect(document.limitations.contains { $0.hasPrefix("objective-c-sources: 1") })
+    }
+
+    @Test("messages와 events를 함께 켜면 문서를 만들지 않고 설정 오류로 거절한다")
+    func rejectsMessagesAndEventsTogether() throws {
+        let service = makeService(files: ["/p/A.swift": "struct A {}"], snapshot: IndexSnapshot())
+        #expect(throws: CartographError.self) {
+            try service.bridgeFacts(messages: true, events: true)
+        }
     }
 
     @Test("closure 없는 Basic method reference는 명시적인 limitation을 남긴다")

@@ -788,8 +788,16 @@ public struct CartographService: Sendable {
     public func bridgeFacts(
         generatedAt: Date = Date(),
         target: BridgeFact.Target? = nil,
-        messages: Bool = false
+        messages: Bool = false,
+        events: Bool = false
     ) throws -> BridgeFactsDocument {
+        // 두 플래그를 함께 켜면 종류별 emit 가드가 서로를 상쇄해 어떤 사실도 나오지
+        // 않는다. 조용히 빈 문서를 돌려주는 대신 설정 오류로 거절한다 — CLI 도 같은
+        // 검사를 하지만 이 API 는 그 아래 공개 경계다.
+        guard !(messages && events) else {
+            throw CartographError.invalidConfiguration(path: projectPath, reason:
+                "--messages and --events produce separate documents; pass one flag at a time.")
+        }
         let canonicalProject: String
         do {
             canonicalProject = try environment.fileSystem.realPath(at: projectPath)
@@ -819,14 +827,17 @@ public struct CartographService: Sendable {
         let resolver = BridgeSymbolResolver(snapshot: snapshot, freshPaths: freshPaths)
         var unreadable = 0
         var objectiveCSources = 0
+        var ffiInteropSources = 0
         var sourceCache: [String: String] = [:]
         let firstPass = scanBridgeFiles(
-            at: sources, resolver: resolver, resolvedValues: [:], canonicalizesPaths: false, messages: messages
+            at: sources, resolver: resolver, resolvedValues: [:], canonicalizesPaths: false,
+            messages: messages, events: events
         ) {
             path in
             guard let source = try? environment.fileSystem.readText(at: path) else { unreadable += 1; return nil }
             sourceCache[ValueFlowSourceLoader.canonicalPath(path)] = source
             if !path.hasSuffix(".swift") { objectiveCSources += 1 }
+            if Self.containsFfiInteropEvidence(source) { ffiInteropSources += 1 }
             return source
         }
         var facts = firstPass.facts
@@ -847,7 +858,8 @@ public struct CartographService: Sendable {
             if !resolved.isEmpty {
                 // 원래 사실을 위치별로 덧대지 않고 다시 스캔해 채널 바인딩과 핸들러가 같은 이름을 쓴다.
                 let secondPass = scanBridgeFiles(
-                    at: sources, resolver: resolver, resolvedValues: resolved, canonicalizesPaths: true, messages: messages
+                    at: sources, resolver: resolver, resolvedValues: resolved, canonicalizesPaths: true,
+                    messages: messages, events: events
                 ) { sourceCache[ValueFlowSourceLoader.canonicalPath($0)] }
                 facts = secondPass.facts
                 opaqueHandlerChannels = secondPass.opaqueHandlerChannels
@@ -861,25 +873,37 @@ public struct CartographService: Sendable {
         if unreadable > 0 {
             extraLimitations.append("unreadable-sources: \(unreadable) file(s) could not be read and were skipped")
         }
+        if ffiInteropSources > 0 {
+            extraLimitations.append(
+                "unscanned-ffi-interop: \(ffiInteropSources) native source file(s) contain FFI/Dart C API evidence outside channel join coverage"
+            )
+        }
         if let target, selectedFacts.count != facts.count {
             extraLimitations.append(
                 "target-filter: \(facts.count - selectedFacts.count) fact(s) did not match \(target.rawValue)"
             )
         }
-        let outputFacts = messages ? selectedFacts.filter { $0.kind == .messageHandle } : selectedFacts
-        try BridgeFactsDocument.validateNames(outputFacts, opaqueHandlerChannels: includesFlutter && !messages ? opaqueHandlerChannels : [])
+        // 전송별 문서는 그 전송의 사실만 담는다. 섞으면 소비자가 transport 없는
+        // 이웃 채널을 같은 메커니즘으로 오인해 조인한다.
+        let outputFacts = messages ? selectedFacts.filter { $0.kind == .messageHandle }
+            : events ? selectedFacts.filter { $0.kind == .streamHandle } : selectedFacts
+        let isScopedDocument = includesFlutter && !messages && !events
+        try BridgeFactsDocument.validateNames(outputFacts, opaqueHandlerChannels: isScopedDocument ? opaqueHandlerChannels : [])
         return BridgeFactsDocument(
             tool: .init(name: Cartograph.toolName, version: Cartograph.version),
             generatedAt: Self.bridgeTimestamp(generatedAt),
             project: canonicalProject,
             facts: outputFacts,
-            unscannedEventChannels: includesFlutter && !messages ? unscannedEventChannels : 0,
-            unscannedMessageChannels: includesFlutter && !messages ? unscannedMessageChannels : 0,
-            objectiveCSourceCount: includesFlutter && !messages ? objectiveCSources : 0,
+            // 전송별 문서에는 그 전송의 관측 공백을 실어야 "없다"와 "못 봤다"를
+            // 소비자가 구분한다. ObjC 파일 수는 어떤 전송의 핸들러든 가릴 수 있어
+            // 문서 구분 없이 실린다.
+            unscannedEventChannels: isScopedDocument || events ? unscannedEventChannels : 0,
+            unscannedMessageChannels: isScopedDocument || messages ? unscannedMessageChannels : 0,
+            objectiveCSourceCount: objectiveCSources,
             extraLimitations: extraLimitations,
-            opaqueHandlerChannels: includesFlutter && !messages ? opaqueHandlerChannels : [],
-            version: messages ? BridgeFactsDocument.messageVersion : BridgeFactsDocument.version,
-            transport: messages ? "basic-message-channel" : nil
+            opaqueHandlerChannels: isScopedDocument ? opaqueHandlerChannels : [],
+            version: (messages || events) ? BridgeFactsDocument.messageVersion : BridgeFactsDocument.version,
+            transport: messages ? "basic-message-channel" : events ? "event-channel" : nil
         )
     }
 
@@ -898,6 +922,7 @@ public struct CartographService: Sendable {
         resolvedValues: [SourceLocation: String],
         canonicalizesPaths: Bool,
         messages: Bool = false,
+        events: Bool = false,
         sourceAt: (String) -> String?
     ) -> (facts: [BridgeFact], opaqueHandlerChannels: [String?], unscannedEventChannels: Int, unscannedMessageChannels: Int) {
         var facts: [BridgeFact] = []
@@ -910,8 +935,9 @@ public struct CartographService: Sendable {
             if path.hasSuffix(".swift") {
                 let scanPath = canonicalizesPaths ? LocalFileSystem.canonicalPath(path) : path
                 let scanned = resolvedValues.isEmpty
-                    ? BridgeFactScanner().scan(source: source, path: scanPath, messages: messages)
-                    : BridgeFactScanner().scan(source: source, path: scanPath, resolvedValues: resolvedValues, messages: messages)
+                    ? BridgeFactScanner().scan(source: source, path: scanPath, messages: messages, events: events)
+                    : BridgeFactScanner().scan(source: source, path: scanPath, resolvedValues: resolvedValues,
+                                               messages: messages, events: events)
                 facts += resolver.resolve(scanned.facts, handlerScopes: scanned.handlerScopes, dependencyBudget: &dependencyBudget)
                 opaqueHandlerChannels += scanned.opaqueHandlerChannels
                 unscannedEventChannels += scanned.unscannedEventChannels
@@ -924,6 +950,18 @@ public struct CartographService: Sendable {
             }
         }
         return (facts, opaqueHandlerChannels, unscannedEventChannels, unscannedMessageChannels)
+    }
+
+    /// 채널 계약이 덮지 못하는 네이티브 interop 표면 — C export, Dart C API, 동적 심볼 조회.
+    /// 어휘 표식이라 주석 안에서도 양성이 나올 수 있다. 그래서 fact가 아니라 파일 수준
+    /// 한계 근거로만 쓴다.
+    private static let ffiInteropMarkers = [
+        "@_cdecl", "@_silgen_name", "dlsym",
+        "Dart_PostCObject", "dart_native_api.h", "dart_api_dl.h",
+    ]
+
+    private static func containsFfiInteropEvidence(_ source: String) -> Bool {
+        ffiInteropMarkers.contains { source.contains($0) }
     }
 
     /// 구문 값 그래프를 실제 컴파일러 대상과 연결해 호출별 요약을 질의한다.
@@ -974,9 +1012,10 @@ public struct CartographService: Sendable {
         generatedAt: Date = Date(),
         asText: Bool = false,
         target: BridgeFact.Target? = nil,
-        messages: Bool = false
+        messages: Bool = false,
+        events: Bool = false
     ) throws -> CommandOutcome {
-        let document = try bridgeFacts(generatedAt: generatedAt, target: target, messages: messages)
+        let document = try bridgeFacts(generatedAt: generatedAt, target: target, messages: messages, events: events)
         return CommandOutcome(output: asText ? document.renderText() : try Self.encodeSortedJSON(document))
     }
 

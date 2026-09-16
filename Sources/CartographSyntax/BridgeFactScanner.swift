@@ -110,7 +110,7 @@ public struct BridgeFactScanner: Sendable {
 
     public func scan(source: String, path: String,
                      resolvedValues: [CartographCore.SourceLocation: String] = [:],
-                     messages: Bool = false) -> BridgeScanResult {
+                     messages: Bool = false, events: Bool = false) -> BridgeScanResult {
         // 파서는 `channel = FlutterMethodChannel(…)` 과 `call.method == "x"` 를 접지 않은
         // SequenceExpr 로 남긴다. 연산자 우선순위로 접어야 대입과 비교가 보인다.
         // 접기 오류(알 수 없는 연산자)는 무시한다. 그 표현식만 못 읽을 뿐이다.
@@ -124,7 +124,8 @@ public struct BridgeFactScanner: Sendable {
         let bindings = BindingCollector(converter: converter, resolvedValues: resolvedValues)
         bindings.walk(tree)
 
-        let collector = BridgeFactCollector(converter: converter, bindings: bindings, path: path, messages: messages)
+        let collector = BridgeFactCollector(converter: converter, bindings: bindings, path: path,
+                                            messages: messages, events: events)
         collector.walk(tree)
         let handlerScopes = collector.handlerScopesByDeclaration.map { key, scopes in
             ScannedBridgeHandlerScopes(declaration: collector.declaration(for: key), scopes: scopes)
@@ -719,6 +720,8 @@ final class BridgeFactCollector: SyntaxVisitor {
     private let bindings: BindingCollector
     private let path: String
     private let messages: Bool
+    /// `true`면 `setStreamHandler` 만 사실로 낸다. MethodChannel 사실은 버전 1 문서의 것이다.
+    private let events: Bool
 
     /// 감싸는 선언의 스택. 사실을 어느 USR 에 귀속시킬지 정한다.
     private var declarations: [EnclosingDeclaration] = []
@@ -739,11 +742,13 @@ final class BridgeFactCollector: SyntaxVisitor {
     /// 지금 어느 함수 본문 안에 있는지. `BindingCollector` 와 같은 키다.
     private var scopes: [Int] = []
 
-    init(converter: SourceLocationConverter, bindings: BindingCollector, path: String, messages: Bool) {
+    init(converter: SourceLocationConverter, bindings: BindingCollector, path: String,
+         messages: Bool, events: Bool = false) {
         self.converter = converter
         self.bindings = bindings
         self.path = path
         self.messages = messages
+        self.events = events
         super.init(viewMode: .sourceAccurate)
     }
 
@@ -914,6 +919,19 @@ final class BridgeFactCollector: SyntaxVisitor {
     override func visit(_ node: FunctionCallExprSyntax) -> SyntaxVisitorContinueKind {
         guard let member = node.calledExpression.as(MemberAccessExprSyntax.self) else { return .visitChildren }
         let isNil = node.arguments.first.map { BindingCollector.isNilHandler($0.expression) } ?? false
+        if events, member.declName.baseName.text == "setStreamHandler", !isNil {
+            let registration = registeredChannel(of: node, receiver: member.base)
+            // 다른 채널 종류로 증명된 수신자는 스트림 등록이 아니다. 미증명 수신자는
+            // 메시지 경로와 같이 동적 이름의 사실로 남긴다 — `resolveChannel` 의 `.method`
+            // 기본값은 "method 채널로 증명됨"이 아니라 "못 풂"이라 섞으면 안 된다.
+            if let proven = provenChannelKind(of: node, receiver: member.base), proven != .event {
+                return .visitChildren
+            }
+            let channelName = registration.flatMap { $0.kind == .event ? $0.name : nil }
+                ?? .dynamic(member.base?.trimmedDescription ?? "setStreamHandler")
+            emit(.streamHandle, target: .flutter, channel: channelName, at: node)
+            return .visitChildren
+        }
         if messages, member.declName.baseName.text == "setMessageHandler", !isNil {
             let closure = Self.handlerClosure(of: node)
             // 수신자를 못 풀어도 범위는 기록한다. 빠뜨리면 그 클로저 안의 참조가
@@ -972,6 +990,23 @@ final class BridgeFactCollector: SyntaxVisitor {
     /// 채널 표현식을 이름으로 푼다. 인라인 생성, 변수, 그 밖의 표현식 순으로 본다.
     private func resolveChannel(_ expression: ExprSyntax) -> (name: ResolvedName, kind: BridgeChannelKind)? {
         resolveChannel(expression, in: context)
+    }
+
+    /// 채널 생성자나 그에 묶인 변수로 종류가 증명될 때만 그 종류. 증명이 없으면 nil —
+    /// `resolveChannel` 은 못 푼 표현식에 `.method` 기본값을 붙이므로 "다른 종류로
+    /// 증명됨"과 "못 풂"을 그 반환값으로는 구분할 수 없다.
+    private func provenChannelKind(of call: FunctionCallExprSyntax, receiver: ExprSyntax?) -> BridgeChannelKind? {
+        // 수신자를 먼저 본다. `channel:` 인자가 수신자보다 앞서면, 수신자가 다른 종류로
+        // 증명된 호출에서도 인자 쪽 종류가 이겨 스트림 사실이 남을 수 있다.
+        for expression in [receiver, call.arguments.first(where: { $0.label?.text == "channel" })?.expression] {
+            guard let expression else { continue }
+            if let inline = bindings.channelConstruction(expression, in: context) { return inline.kind }
+            if let name = BindingCollector.identifierName(of: expression),
+               let bound = bindings.channelDetails(named: name, in: context), let bound {
+                return bound.kind
+            }
+        }
+        return nil
     }
 
     private func resolveChannel(
@@ -1033,11 +1068,15 @@ final class BridgeFactCollector: SyntaxVisitor {
               case let .case(label) = node.label,
               let (channel, inferred) = currentHandlerChannel
         else { return .visitChildren }
+        // case 절 범위가 이 메서드의 분기 근거다. 같은 절의 여러 패턴은 같은 범위를 나누고,
+        // 인덱스 귀속은 그 안의 참조만 이 분기로 본다.
+        let scope = sourceScope(from: node.positionAfterSkippingLeadingTrivia, to: node.endPosition)
         for item in label.caseItems {
             guard let expression = item.pattern.as(ExpressionPatternSyntax.self)?.expression else { continue }
             emit(
                 .methodHandle, target: .flutter, channel: channel,
-                method: bindings.resolveString(expression, in: context), inferred: inferred, at: item
+                method: bindings.resolveString(expression, in: context),
+                handlerScope: scope, inferred: inferred, at: item
             )
         }
         return .visitChildren
@@ -1061,13 +1100,50 @@ final class BridgeFactCollector: SyntaxVisitor {
         else { return .visitChildren }
         let sides = [(node.leftOperand, node.rightOperand), (node.rightOperand, node.leftOperand)]
         for (subject, value) in sides where isMethodNameExpression(subject) {
+            // 분기 범위는 그 조건을 단 `if`의 then 본문이다. 조건식 안의 `==`가 아니라
+            // 본문 안의 다른 `==`이면 스코프로 쓰지 않는다.
             emit(
                 .methodHandle, target: .flutter, channel: channel,
-                method: bindings.resolveString(value, in: context), inferred: inferred, at: value
+                method: bindings.resolveString(value, in: context),
+                handlerScope: enclosingIfBodyScope(of: node), inferred: inferred, at: value
             )
             break
         }
         return .visitChildren
+    }
+
+    /// 절대 위치 두 개를 `HandlerScope` 로 옮긴다.
+    private func sourceScope(from start: AbsolutePosition, to end: AbsolutePosition) -> BridgeFact.HandlerScope {
+        let first = converter.location(for: start)
+        let last = converter.location(for: end)
+        return BridgeFact.HandlerScope(
+            start: SourceLocation(path: path, line: first.line, column: first.column),
+            end: SourceLocation(path: path, line: last.line, column: last.column),
+            complete: false
+        )
+    }
+
+    /// 이 비교가 조건인 가장 가까운 `if`의 then 본문 범위. 조건이 아닌 곳의 `==`는 nil.
+    private func enclosingIfBodyScope(of node: some SyntaxProtocol) -> BridgeFact.HandlerScope? {
+        var current = node.parent
+        while let syntax = current {
+            if let ifExpression = syntax.as(IfExprSyntax.self) {
+                // then 본문이 이 비교의 참을 요구할 때만 분기 근거다. `!(x == "a")`나
+                // `x == "a" || y` 처럼 조건 요소가 이 `==` 자체가 아니면 본문 실행이
+                // 그 메서드를 보장하지 않으므로 근거를 붙이지 않는다.
+                let isPositiveCondition = ifExpression.conditions.contains { element in
+                    guard case let .expression(condition) = element.condition else { return false }
+                    return Self.unparenthesized(condition).id == node.id
+                }
+                guard isPositiveCondition else { return nil }
+                return sourceScope(
+                    from: ifExpression.body.positionAfterSkippingLeadingTrivia,
+                    to: ifExpression.body.endPosition
+                )
+            }
+            current = syntax.parent
+        }
+        return nil
     }
 
     /// `call.method` 처럼 메서드 이름을 읽는 표현식이거나, 그것을 담은 지역 변수인지.
@@ -1175,6 +1251,7 @@ final class BridgeFactCollector: SyntaxVisitor {
         at node: some SyntaxProtocol
     ) {
         guard !messages || kind == .messageHandle else { return }
+        guard !events || kind == .streamHandle else { return }
         let location = node.startLocation(converter: converter)
         let fact = BridgeFact(
             kind: kind,
@@ -1182,8 +1259,8 @@ final class BridgeFactCollector: SyntaxVisitor {
             channel: channel?.text,
             method: method?.text,
             isDynamic: (channel?.isDynamic ?? false) || (method?.isDynamic ?? false),
-            channelPrefix: messages ? channel?.channelPrefix : nil,
-            handlerScope: messages ? handlerScope : nil,
+            channelPrefix: (messages || events) ? channel?.channelPrefix : nil,
+            handlerScope: handlerScope,
             isChannelInferred: inferred,
             location: SourceLocation(path: path, line: location.line, column: location.column)
         )

@@ -991,6 +991,146 @@ struct BridgeFactScannerTests {
         #expect(fact?.dependencies == nil)
     }
 
+    @Test("events 선택은 setStreamHandler만 stream-handle로 내고 MethodChannel 사실은 버린다")
+    func recordsStreamHandlersOnlyWhenOptedIn() {
+        let source = """
+            let events = FlutterEventChannel(name: "com.example/charging", binaryMessenger: m)
+            events.setStreamHandler(self)
+            let channel = FlutterMethodChannel(name: "com.example/battery", binaryMessenger: m)
+            channel.setMethodCallHandler { call, result in
+                switch call.method { case "getBatteryLevel": result(1) default: break }
+            }
+            let basic = BasicMessageChannel<Any?>(name: "pigeon", binaryMessenger: m)
+            basic.setMessageHandler { _, _ in }
+            """
+        let result = BridgeFactScanner().scan(source: source, path: "/p/A.swift", events: true)
+        #expect(result.facts.map(\.fact.kind) == [.streamHandle])
+        #expect(result.facts.first?.fact.channel == "com.example/charging")
+        #expect(result.facts.first?.fact.isDynamic == false)
+        #expect(result.facts.first?.fact.method == nil)
+    }
+
+    @Test("풀지 못한 수신자의 setStreamHandler도 동적 이름의 사실로 남긴다")
+    func unresolvedStreamReceiverKeepsFact() {
+        let source = """
+            func install(stream: FlutterStreamHandler, channel: FlutterEventChannel) {
+                channel.setStreamHandler(stream)
+            }
+            """
+        let result = BridgeFactScanner().scan(source: source, path: "/p/A.swift", events: true)
+        #expect(result.facts.map(\.fact.kind) == [.streamHandle])
+        #expect(result.facts.first?.fact.channel == "channel")
+        #expect(result.facts.first?.fact.isDynamic == true)
+    }
+
+    @Test("nil 스트림 핸들러는 해제라 사실로 남기지 않는다")
+    func nilStreamHandlerIsNotAFact() {
+        let source = """
+            let events = FlutterEventChannel(name: "com.example/charging", binaryMessenger: m)
+            events.setStreamHandler(nil)
+            """
+        let result = BridgeFactScanner().scan(source: source, path: "/p/A.swift", events: true)
+        #expect(result.facts.isEmpty)
+    }
+
+    @Test("다른 채널 종류로 증명된 수신자의 setStreamHandler는 사실로 남기지 않는다")
+    func provenNonEventReceiverProducesNoStreamFact() {
+        let source = """
+            let methods = FlutterMethodChannel(name: "com.example/methods", binaryMessenger: m)
+            methods.setStreamHandler(self)
+            let basics = BasicMessageChannel<Any?>(name: "com.example/basic", binaryMessenger: m)
+            basics.setStreamHandler(self)
+            FlutterMethodChannel(name: "com.example/inline", binaryMessenger: m).setStreamHandler(self)
+            """
+        let result = BridgeFactScanner().scan(source: source, path: "/p/A.swift", events: true)
+        #expect(result.facts.isEmpty)
+    }
+
+    @Test("channel: 인자보다 수신자의 증명된 종류가 우선이다")
+    func provenReceiverBeatsChannelArgument() {
+        let source = """
+            let methods = FlutterMethodChannel(name: "com.example/methods", binaryMessenger: m)
+            let events = FlutterEventChannel(name: "com.example/events", binaryMessenger: m)
+            methods.setStreamHandler(self, channel: events)
+            """
+        let result = BridgeFactScanner().scan(source: source, path: "/p/A.swift", events: true)
+        #expect(result.facts.isEmpty)
+    }
+
+    @Test("비교가 참임을 보장하지 않는 조건 형태의 if는 분기 근거를 붙이지 않는다")
+    func negatedIfConditionCarriesNoBranchScope() throws {
+        let source = """
+            let channel = FlutterMethodChannel(name: "c", binaryMessenger: m)
+            channel.setMethodCallHandler { call, result in
+                if !(call.method == "a") { result(helperA()) }
+                if call.method == "b" || flag { result(helperB()) }
+                if call.method == "c" { result(helperC()) }
+                if (call.method == "d") { result(helperD()) }
+            }
+            """
+        let handled = facts(source, of: .methodHandle)
+        // #require — 목록이 짧으면 아래 인덱싱이 트랩해 테스트 런 전체를 멈춘다.
+        try #require(handled.map(\.method) == ["a", "b", "c", "d"])
+        // 양성 대조군 — 그 `==` 인 조건과 괄호로 감싼 형태는 여전히 범위를 단다.
+        // 없으면 "모든 if 에 범위가 안 붙는" 회귀도 이 테스트를 통과한다.
+        #expect(handled[2].handlerScope != nil && handled[3].handlerScope != nil)
+        #expect(handled[0].handlerScope == nil && handled[1].handlerScope == nil)
+    }
+
+    @Test("같은 절의 case 항목들은 같은 분기 범위를 나눈다")
+    func siblingCaseItemsShareBranchScope() {
+        let source = """
+            let channel = FlutterMethodChannel(name: "c", binaryMessenger: m)
+            channel.setMethodCallHandler { call, result in
+                switch call.method {
+                case "a":
+                    result(helperA())
+                case "b", "c":
+                    result(helperB())
+                default: break
+                }
+            }
+            """
+        let handled = facts(source, of: .methodHandle)
+        #expect(handled.map(\.method) == ["a", "b", "c"])
+        #expect(handled.allSatisfy { $0.handlerScope != nil })
+        let scopes = handled.map { ($0.handlerScope!.start.line, $0.handlerScope!.end.line) }
+        #expect(scopes[0] != scopes[1])
+        #expect(scopes[1] == scopes[2])
+    }
+
+    @Test("if 조건의 메서드 비교는 then 본문을 분기 범위로 단다")
+    func methodComparisonAttachesThenBodyScope() {
+        let source = """
+            let channel = FlutterMethodChannel(name: "c", binaryMessenger: m)
+            channel.setMethodCallHandler { call, result in
+                if call.method == "a" {
+                    result(helperA())
+                }
+            }
+            """
+        let handled = facts(source, of: .methodHandle)
+        #expect(handled.map(\.method) == ["a"])
+        #expect(handled.first?.handlerScope != nil)
+        // then 본문은 `if` 머리가 아니라 `{`(3행)에서 `}`(5행)까지다.
+        #expect(handled.first?.handlerScope?.start.line == 3)
+        #expect(handled.first?.handlerScope?.end.line == 5)
+    }
+
+    @Test("조건 위치가 아닌 메서드 비교는 범위 없이 사실만 남긴다")
+    func nonConditionComparisonKeepsFactWithoutScope() {
+        let source = """
+            let channel = FlutterMethodChannel(name: "c", binaryMessenger: m)
+            channel.setMethodCallHandler { call, result in
+                let matches = call.method == "a"
+                result(matches)
+            }
+            """
+        let handled = facts(source, of: .methodHandle)
+        #expect(handled.map(\.method) == ["a"])
+        #expect(handled.first?.handlerScope == nil)
+    }
+
     @Test("call.method 가 아닌 switch 는 건드리지 않는다")
     func ignoresUnrelatedSwitches() {
         let source = """
