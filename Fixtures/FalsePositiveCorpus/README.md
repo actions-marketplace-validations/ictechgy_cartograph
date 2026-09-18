@@ -123,3 +123,11 @@ comment is doing real work: it must neither be reported as superfluous nor let t
 surface in `expected-unused.txt`. `FileIgnored.swift` carries `cartograph:ignore:all` over a
 file whose only declaration is used, producing one file-scope diagnostic instead of one per
 declaration. The full list lives in `expected-superfluous-ignore.txt`.
+
+## Redundant public accessibility stays quiet under retention
+
+`Scripts/verify-fixtures.sh` asserts that `redundant-public` reports nothing under
+`--retain-public`. That mode declares the public surface intentional, so the rule must fall silent
+instead of listing every public member the module reads itself. The default mode is not pinned
+here: the corpus legitimately contains public surface used only inside the module (for example the
+`InheritedAccessHost` the public extension APIs hang off), and the rule is allowed to say so.
