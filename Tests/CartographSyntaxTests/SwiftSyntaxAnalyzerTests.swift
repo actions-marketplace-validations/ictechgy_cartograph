@@ -156,6 +156,24 @@ struct SwiftSyntaxAnalyzerTests {
         #expect(facts.declaration(named: "Normal")?.attributes.contains(.ignoreComment) == false)
     }
 
+    @Test("물려받은 무시와 자기 주석을 표식으로 구분한다")
+    func inheritedIgnoreIsMarkedSeparatelyFromOwnComment() {
+        let facts = analyze("""
+            // cartograph:ignore
+            struct Legacy {
+                func inner() {}
+                // cartograph:ignore
+                func ownComment() {}
+            }
+            """)
+        // 자기 주석이 없는 멤버는 조상이 물려준 무시라 `.ignoreInherited` 가
+        // 붙고, 자기 주석이 있는 선언은 붙지 않는다 — 이 구분이 없으면
+        // 불필요 주석 진단이 없는 코멘트를 찾아 헤맨다.
+        #expect(facts.declaration(named: "Legacy")?.attributes.contains(.ignoreInherited) == false)
+        #expect(facts.declaration(named: "inner")?.attributes.contains(.ignoreInherited) == true)
+        #expect(facts.declaration(named: "ownComment")?.attributes.contains(.ignoreInherited) == false)
+    }
+
     @Test("파일 단위 무시 주석을 인식한다")
     func fileLevelIgnore() {
         let ignored = analyze("""
@@ -350,6 +368,34 @@ struct CommentCommandTests {
         #expect(CommentCommand.parse(comment: "// cartograph:ignore:all") == .ignoreAll)
         #expect(CommentCommand.parse(comment: "// cartograph:ignore") == .ignore)
         #expect(CommentCommand.parse(comment: "// 그냥 주석") == nil)
+    }
+
+    @Test("명령을 언급하는 문장은 지시가 아니다")
+    func mentionIsNotACommand() {
+        // 도구의 문서 주석이 무시 표식으로 오인된 실제 오탐.
+        #expect(CommentCommand.parse(comment: "/// `cartograph:ignore` 를 떼어 내도") == nil)
+        #expect(CommentCommand.parse(comment: "// NOTE: cartograph:ignore") == nil)
+        #expect(CommentCommand.parse(comment: "// cartograph:ignore-something") == nil)
+        #expect(CommentCommand.parse(comment: "// cartograph:ignore:other") == nil)
+        // 명령 뒤의 설명은 허용한다.
+        #expect(CommentCommand.parse(comment: "// cartograph:ignore — 외부 DI 대상") == .ignore)
+        #expect(CommentCommand.parse(comment: "//cartograph:ignore") == .ignore)
+    }
+
+    @Test("명령을 언급하는 문서 주석은 선언을 무시하지 않는다")
+    func docMentionDoesNotIgnore() {
+        let facts = SwiftSyntaxAnalyzer().analyze(
+            source: """
+                /// `cartograph:ignore` 를 떼어 내도 보고되지 않는 선언.
+                struct MentionedButNotIgnored {
+                    /// `cartograph:ignore:all` 은 파일 전체를 덮는다.
+                    func ping() {}
+                }
+                """,
+            path: "/Mention.swift"
+        )
+        #expect(facts.declaration(named: "MentionedButNotIgnored")?.attributes.contains(.ignoreComment) == false)
+        #expect(facts.declaration(named: "ping")?.attributes.contains(.ignoreComment) == false)
     }
 }
 

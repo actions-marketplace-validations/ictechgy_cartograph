@@ -307,9 +307,10 @@ public struct IndexStoreProvider: IndexProviding {
             // readonly 는 거짓이어야 한다. 참이면 같은 함수가 유닛을 넣기 전에
             // 곧바로 반환해 빈 인덱스가 된다. 여기서 쓰는 데이터베이스는 우리가
             // 만드는 캐시이므로 쓰기가 필요하다.
+            let databasePath = prepareReaderDatabase()
             return try IndexStoreDB(
                 storePath: configuration.storePath,
-                databasePath: configuration.databasePath,
+                databasePath: databasePath,
                 library: library,
                 waitUntilDoneInitializing: true,
                 readonly: false,
@@ -413,6 +414,117 @@ public struct IndexStoreProvider: IndexProviding {
             if sites[middle].location < location { low = middle + 1 } else { high = middle }
         }
         return low > 0 ? sites[low - 1].usr : nil
+    }
+
+    /// 판독기 DB를 열기 전에 경로를 정하고 형제를 정리한다.
+    ///
+    /// 판독기 DB 는 사라진 유닛을 잊지 않는다 — 유닛 파일이 지워져도 항목이
+    /// 남아, `symbolOccurrences(inFilePath:)` 가 유령 유닛으로 해석해 그 파일의
+    /// 발생을 통째로 비운다. 유닛 목록의 지문을 경로에 섞으면 유닛이 바뀔
+    /// 때마다 새 DB 로 갈아타 유령이 로드될 수 없고, 지문이 같으면 같은 DB 를
+    /// 재사용한다.
+    ///
+    /// 지문을 만들 수 있으면 지문 경로를 쓰고 다른 형제를 지운다. 지문을 못
+    /// 만들면 `-unverified` 경로를 쓰는데, 이 경로는 실행 간에 재사용되므로
+    /// 지워진 유닛을 담은 낡은 DB 가 유령 유닛 버그를 그대로 재현할 수 있다 —
+    /// 열기 전에 항상 지워 새 DB 만 만든다. 같은 이유로 지문이 없을 때는
+    /// 형제를 건드리지 않는다 — 일시적인 목록 실패 하나가 검증된 캐시 전체를
+    /// 지우는 것은 유령보다 나쁘다.
+    func prepareReaderDatabase() -> String {
+        let signature = unitsSignature()
+        guard !signature.isEmpty else {
+            let path = configuration.databasePath + "-unverified"
+            do {
+                try fileSystem.removeItem(at: path)
+                return path
+            } catch {
+                // 없는 경로는 지울 것도 없으니 그대로 쓴다. 그 밖의 실패는
+                // 낡은 DB 를 그대로 여는 셈이니 재사용하지 않고 한 번만 쓰는
+                // 경로로 돌린다 — `unverified-` 접미는 정리 대상 형태라
+                // 다음 정리가 거둔다.
+                let nsError = error as NSError
+                let isAbsent =
+                    (nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileNoSuchFileError)
+                    || (nsError.domain == NSPOSIXErrorDomain && nsError.code == ENOENT)
+                return isAbsent ? path : path + "-" + UUID().uuidString
+            }
+        }
+        let path = configuration.databasePath + "-" + signature
+        pruneStaleReaderDatabases(keeping: path)
+        return path
+    }
+
+    /// 지문이 바뀔 때마다 생기는 형제 판독기 DB 디렉터리를 정리한다.
+    ///
+    /// 현재 경로만 남기고, 버전 없는 예전 경로와 다른 지문의 형제는 전부
+    /// 지운다 — 버전 없는 경로에는 유령 유닛 버그를 일으킨 낡은 DB 가
+    /// 남아 있을 수 있다. 지우는 대상은 우리가 만든 이름 형태(`baseName`,
+    /// `baseName-16진 지문`, `baseName-unverified`)뿐이다 — `databasePath`
+    /// 를 호출자가 정할 수 있어, 접두사만 맞으면 지우는 방식은 `db-backup`
+    /// 같은 무관한 항목까지 지울 수 있다. 정리는 정확도와 무관한 부수
+    /// 작업이라 지우지 못한 항목은 다음 실행의 정리에 맡긴다.
+    func pruneStaleReaderDatabases(keeping currentPath: String) {
+        let base = (configuration.databasePath as NSString).standardizingPath
+        let baseName = (base as NSString).lastPathComponent
+        let parent = (base as NSString).deletingLastPathComponent
+        let current = (currentPath as NSString).standardizingPath
+        guard let entries = try? fileSystem.contentsOfDirectory(at: parent)
+        else { return }
+        for entry in entries {
+            let name = (entry as NSString).lastPathComponent
+            guard name == baseName || isReaderDatabaseSuffix(name, baseName: baseName),
+                  (entry as NSString).standardizingPath != current
+            else { continue }
+            // 같은 스토어를 동시에 여는 프로세스가 서로의 열린 DB 를 지우는
+            // 것을 유예로 줄인다 — 막 만든 형제를 지우는 것이 가장 위험하다.
+            // 유예를 넘긴 낡은 형제는 여전히 지워 캐시 누적은 막는다.
+            if let modified = fileSystem.modificationDate(at: entry),
+               Date().timeIntervalSince(modified) < Self.pruneGraceInterval { continue }
+            try? fileSystem.removeItem(at: entry)
+        }
+    }
+
+    /// 형제 DB 를 지우기 전에 기다리는 유예(초). 열린 지 얼마 안 된 DB 를
+    /// 지우는 경쟁만 피하면 되므로 짧게 둔다.
+    private static let pruneGraceInterval: TimeInterval = 300
+
+    /// `baseName-` 뒤가 우리가 붙인 접미 형태인지 — `unverified`,
+    /// `unverified-…`(삭제 실패 폴백), 고정폭 16자 FNV-1a 지문.
+    ///
+    /// 길이나 문자 집합을 넓게 보면 `db-2024` 같은 호출자 소유 항목까지
+    /// 지우게 되므로 지문은 `unitsSignature()` 가 만드는 형태 그대로만
+    /// 인정한다.
+    private func isReaderDatabaseSuffix(_ name: String, baseName: String) -> Bool {
+        guard name.hasPrefix(baseName + "-") else { return false }
+        let suffix = name.dropFirst(baseName.count + 1)
+        if suffix == "unverified" || suffix.hasPrefix("unverified-") { return true }
+        // 지문은 `unitsSignature()` 가 만드는 고정폭 16자 소문자 ASCII
+        // 16진이다 — `db-2024`·`db-dead` 처럼 짧은 16진 접미는 호출자
+        // 소유일 수 있어 지우지 않는다.
+        return suffix.count == 16
+            && suffix.utf8.allSatisfy {
+                ($0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9"))
+                    || ($0 >= UInt8(ascii: "a") && $0 <= UInt8(ascii: "f"))
+            }
+    }
+
+    /// `<스토어>/v5/units`(없으면 `units`)의 유닛 파일 이름 지문.
+    ///
+    /// 유닛 이름은 컴파일 호출의 해시라, 출력물이 교체되거나 파일이 추가·삭제될
+    /// 때만 바뀐다 — 본문만 바뀐 재컴파일에서는 그대로라 캐시가 계속 유효하다.
+    /// 목록을 읽지 못하면 빈 문자열을 돌려 경로를 바꾸지 않는다.
+    func unitsSignature() -> String {
+        let candidates = ["v5/units", "units"].map {
+            (configuration.storePath as NSString).appendingPathComponent($0)
+        }
+        guard let unitsDir = candidates.first(where: { fileSystem.directoryExists(at: $0) }),
+              let names = try? fileSystem.contentsOfDirectory(at: unitsDir)
+        else { return "" }
+        // 앞자리 0을 떼는 radix 문자열 대신 고정폭으로 둔다 — 형제 정리가
+        // "16자 16진" 하나의 형태만 지우게 하려면 지문 자체가 항상 그
+        // 형태여야 한다.
+        let raw = Self.stableHash(names.sorted().joined(separator: "\n"))
+        return String(repeating: "0", count: max(0, 16 - raw.count)) + raw
     }
 
     /// 인덱스 스토어마다 안정적으로 대응되는 캐시 디렉터리 경로.

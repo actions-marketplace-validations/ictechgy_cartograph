@@ -258,6 +258,28 @@ like `import struct Foundation.Bundle` are judged by their head module — a use
 `Foundation` counts as use of the import — and the diagnostic spells the full form. Like the
 other warning rules, `unused-import` does not count toward `--strict`.
 
+`dead` also reports `cartograph:ignore` comments that suppress nothing, as warnings under the
+`superfluous-ignore` rule:
+
+```console
+Sources/Net/Client.swift:41:1: warning: ignore comment on 'Net.Client' and 2 declaration(s) it covers is superfluous — removing it would report nothing
+```
+
+A comment on a declaration that ordinary references already keep alive does no work, yet leaves
+the false impression that the code is dead. The check is counterfactual: the analysis re-runs
+reachability with only that comment removed, and the comment is reported only when no new
+finding appears — so a comment on genuinely dead code keeps suppressing it, and a comment whose
+removal would expose an unreachable declaration is never flagged. Dead-code is not the only
+counterfactual: test-only, assign-only-property and unused-import findings count too. A
+declaration-level comment covers its whole member subtree — a member it ignores is folded into
+that comment's judgement rather than treated as a comment of its own, while a member carrying
+its own comment is judged separately. Since a retained member keeps its containing type alive,
+an unreferenced type's own comment can be judged superfluous when a member's comment is doing
+the retaining. A file-level `cartograph:ignore:all` comment is judged as
+one file-scope unit and reported once; comments on individual declarations are judged
+independently, even when every declaration in a file carries one. Like the other warning rules,
+`superfluous-ignore` does not count toward `--strict`.
+
 `--report-test-only` answers a different question: which production declarations are reached
 **only** from tests or previews. They are not dead — deleting one breaks a test — but a team wants
 to know that tests are the sole caller. Reported as `info`, so they never fail a build.

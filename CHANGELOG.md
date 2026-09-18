@@ -7,6 +7,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `dead` reports `cartograph:ignore` comments that suppress nothing, as warnings under the
+  `superfluous-ignore` rule — the same judgement Periphery 3.7 added. The check is
+  counterfactual: reachability is re-run with only that comment removed, and the comment is
+  reported only when no new finding would appear — dead-code, test-only, assign-only-property
+  and unused-import findings all count. Comments on genuinely dead declarations keep
+  suppressing them, a comment covering a used declaration is flagged, and a file-level
+  `cartograph:ignore:all` comment is judged once as a file-scope unit while per-declaration
+  comments are judged independently even when every declaration in a file carries one. A
+  declaration-level comment covers its whole member subtree — members it ignores are folded
+  into that comment's judgement instead of being mistaken for comments of their own, while a
+  member carrying its own comment is judged separately. Warnings do not count toward
+  `--strict`.
+
+### Fixed
+
+- The persistent index-reader database no longer serves a file's occurrences from a deleted
+  "ghost" unit. IndexStoreDB keeps unit entries after the unit file is removed, and
+  `symbolOccurrences(inFilePath:)` could resolve to such a stale unit and return zero
+  occurrences — silently dropping a whole file's edges (observed as `main.swift` losing all
+  top-level references after `.build` was recreated). The unit-file set is now part of the
+  database path, so a changed unit set opens a fresh reader database while an unchanged set
+  keeps reusing the cache. Stale sibling databases and the unversioned legacy path are pruned
+  on open, and an unreadable unit directory falls back to a dedicated `-unverified` path
+  instead of reusing the legacy cache.
+- `// cartograph:ignore` detection no longer treats a doc comment that merely mentions the
+  directive as an ignore comment. The marker is now only recognized at the start of a comment
+  line and must be followed by whitespace or end of line, so `/// Use // cartograph:ignore
+  to …` documents the feature without marking the declaration ignored.
+
 ### Changed
 
 - `serve` re-verifies the session input fingerprint at most once per second instead of
