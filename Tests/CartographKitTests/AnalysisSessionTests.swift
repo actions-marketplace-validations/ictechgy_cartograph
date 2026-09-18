@@ -63,6 +63,206 @@ struct AnalysisSessionTests {
         #expect(state.indexLoadCount == 2)
     }
 
+    @Test("재검증 창 안에서는 입력 지문을 다시 읽지 않고 이전 세대를 쓴다")
+    func skipsFingerprintReadsWithinFreshnessWindow() throws {
+        let state = SessionState(snapshot: makeSnapshot())
+        var fingerprintReads = 0
+        let session = try AnalysisSession(
+            serviceFactory: { try state.makeService() },
+            inputFingerprintProvider: {
+                fingerprintReads += 1
+                return try state.nextFingerprint()
+            },
+            freshnessCheckInterval: .seconds(3600)
+        )
+        let readsDuringPrepare = fingerprintReads
+        #expect(readsDuringPrepare > 0)
+
+        _ = try session.query(symbols: ["App"])
+        _ = try session.query(symbols: ["Service"])
+        _ = try session.status()
+        // 준비 때 읽은 지문이 창 안에서는 다시 검증되지 않으므로 읽기 수가 그대로다.
+        #expect(fingerprintReads == readsDuringPrepare)
+
+        // 창 안에서는 입력이 바뀌어도 아직 이전 세대를 쓴다 — 유보 상한이 명시된 계약이다.
+        state.fingerprint = "changed"
+        state.snapshot = makeSnapshot(extra: "NewService")
+        _ = try session.query(symbols: ["App"])
+        #expect(session.metadata?.generation == 1)
+    }
+
+    @Test("재검증 창이 지나면 다음 요청에서 입력을 다시 읽는다")
+    func reverifiesAfterFreshnessWindowElapses() throws {
+        let state = SessionState(snapshot: makeSnapshot())
+        var virtualNow = ContinuousClock().now
+        let session = try AnalysisSession(
+            serviceFactory: { try state.makeService() },
+            inputFingerprintProvider: { try state.nextFingerprint() },
+            freshnessCheckInterval: .milliseconds(50),
+            now: { virtualNow }
+        )
+        _ = try session.query(symbols: ["App"])
+        #expect(session.metadata?.generation == 1)
+
+        state.fingerprint = "second"
+        state.snapshot = makeSnapshot(extra: "Reloaded")
+        // 창 경과는 수면 대신 주입한 시각을 진행해 결정적으로 확인한다.
+        virtualNow = virtualNow.advanced(by: .milliseconds(100))
+
+        let batch = try session.query(symbols: ["Reloaded"])
+        #expect(batch.results.first?.status == "found")
+        #expect(session.metadata?.generation == 2)
+        #expect(session.metadata?.fingerprint == "second")
+    }
+
+    @Test("명시적 refresh는 재검증 창 안에서도 항상 입력을 다시 읽는다")
+    func explicitRefreshIgnoresFreshnessWindow() throws {
+        let state = SessionState(snapshot: makeSnapshot())
+        var fingerprintReads = 0
+        let session = try AnalysisSession(
+            serviceFactory: { try state.makeService() },
+            inputFingerprintProvider: {
+                fingerprintReads += 1
+                return try state.nextFingerprint()
+            },
+            freshnessCheckInterval: .seconds(3600)
+        )
+        state.fingerprint = "second"
+        state.snapshot = makeSnapshot(extra: "Reloaded")
+
+        let metadata = try session.refresh()
+
+        #expect(metadata.generation == 2)
+        #expect(metadata.fingerprint == "second")
+
+        // refresh 가 찍은 검증 시각부터 창이 다시 시작되므로 직후 요청은
+        // 새 세대를 그대로 쓰고 지문을 다시 읽지 않는다.
+        let readsAfterRefresh = fingerprintReads
+        _ = try session.query(symbols: ["Reloaded"])
+        #expect(fingerprintReads == readsAfterRefresh)
+        #expect(session.metadata?.generation == 2)
+    }
+
+    @Test("기본 재검증 창 .zero 는 요청마다 입력 지문을 다시 읽는다")
+    func defaultFreshnessIntervalChecksEveryRequest() throws {
+        let state = SessionState(snapshot: makeSnapshot())
+        var fingerprintReads = 0
+        let session = try AnalysisSession(
+            serviceFactory: { try state.makeService() },
+            inputFingerprintProvider: {
+                fingerprintReads += 1
+                return try state.nextFingerprint()
+            }
+        )
+        let readsDuringPrepare = fingerprintReads
+
+        _ = try session.status()
+        _ = try session.status()
+
+        #expect(fingerprintReads >= readsDuringPrepare + 2)
+    }
+
+    @Test("음수 재검증 창도 .zero 와 같이 요청마다 입력 지문을 다시 읽는다")
+    func negativeFreshnessIntervalChecksEveryRequest() throws {
+        let state = SessionState(snapshot: makeSnapshot())
+        var fingerprintReads = 0
+        let session = try AnalysisSession(
+            serviceFactory: { try state.makeService() },
+            inputFingerprintProvider: {
+                fingerprintReads += 1
+                return try state.nextFingerprint()
+            },
+            freshnessCheckInterval: .seconds(-1)
+        )
+        let readsDuringPrepare = fingerprintReads
+
+        _ = try session.status()
+        _ = try session.status()
+
+        #expect(fingerprintReads >= readsDuringPrepare + 2)
+    }
+
+    @Test("변경 없는 재검증은 창을 다시 시작해 직후의 변경도 다음 창까지 유보한다")
+    func unchangedReverificationRestartsFreshnessWindow() throws {
+        let state = SessionState(snapshot: makeSnapshot())
+        var virtualNow = ContinuousClock().now
+        let session = try AnalysisSession(
+            serviceFactory: { try state.makeService() },
+            inputFingerprintProvider: { try state.nextFingerprint() },
+            freshnessCheckInterval: .milliseconds(500),
+            now: { virtualNow }
+        )
+        // 창이 지난 뒤의 요청은 지문을 다시 읽고 그 시각부터 창이 다시 시작된다.
+        // 주입한 시각을 진행하면 호출 소요와 무관하게 경계가 결정적이다.
+        virtualNow = virtualNow.advanced(by: .milliseconds(600))
+        _ = try session.status()
+        #expect(session.metadata?.generation == 1)
+
+        // 재검증 직후의 입력 변경은 다시 시작된 창 안이라 이전 세대로 응답한다.
+        state.fingerprint = "second"
+        state.snapshot = makeSnapshot(extra: "Reloaded")
+        _ = try session.status()
+        #expect(session.metadata?.generation == 1)
+
+        virtualNow = virtualNow.advanced(by: .milliseconds(600))
+        _ = try session.status()
+        #expect(session.metadata?.generation == 2)
+        #expect(session.metadata?.fingerprint == "second")
+    }
+
+    @Test("창이 켜진 세션에서도 명시적 refresh 실패는 문맥을 폐기해 다음 요청이 다시 읽게 한다")
+    func failedRefreshDiscardsWindowedSession() throws {
+        let state = SessionState(snapshot: makeSnapshot())
+        var fingerprintReads = 0
+        let session = try AnalysisSession(
+            serviceFactory: { try state.makeService() },
+            inputFingerprintProvider: {
+                fingerprintReads += 1
+                return try state.nextFingerprint()
+            },
+            freshnessCheckInterval: .seconds(3600)
+        )
+        state.fingerprintShouldFail = true
+        #expect(throws: SessionFingerprintError.self) {
+            _ = try session.refresh()
+        }
+        #expect(session.metadata == nil)
+
+        // 실패로 폐기된 세션은 창과 무관하게 다음 요청에서 지문을 다시 읽는다.
+        state.fingerprintShouldFail = false
+        let readsBeforeRecovery = fingerprintReads
+        _ = try session.status()
+        #expect(fingerprintReads > readsBeforeRecovery)
+        #expect(session.metadata?.generation == 2)
+    }
+
+    @Test("창이 지난 뒤 지문 읽기가 실패해도 세션을 폐기해 다음 요청이 다시 읽게 한다")
+    func expiredWindowFingerprintFailureDiscardsSession() throws {
+        let state = SessionState(snapshot: makeSnapshot())
+        var virtualNow = ContinuousClock().now
+        let session = try AnalysisSession(
+            serviceFactory: { try state.makeService() },
+            inputFingerprintProvider: { try state.nextFingerprint() },
+            freshnessCheckInterval: .milliseconds(50),
+            now: { virtualNow }
+        )
+        state.fingerprintShouldFail = true
+        virtualNow = virtualNow.advanced(by: .milliseconds(100))
+
+        #expect(throws: SessionFingerprintError.self) {
+            _ = try session.status()
+        }
+        #expect(session.metadata == nil)
+
+        // 폐기된 세션은 복구된 입력으로 다음 요청에서 새 세대를 만든다.
+        state.fingerprintShouldFail = false
+        state.fingerprint = "recovered"
+        state.snapshot = makeSnapshot(extra: "Recovered")
+        _ = try session.status()
+        #expect(session.metadata?.generation == 2)
+        #expect(session.metadata?.fingerprint == "recovered")
+    }
+
     @Test("serviceFactory 초기화는 새 서비스의 설정과 문맥을 다시 읽는다")
     func factoryConvenienceReloadsFreshService() throws {
         let fileSystem = InMemoryFileSystem(
