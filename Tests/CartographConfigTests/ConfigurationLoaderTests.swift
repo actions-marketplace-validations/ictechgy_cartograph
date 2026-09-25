@@ -29,6 +29,7 @@ struct ConfigurationLoaderTests {
         thresholds:
           max_cycles: 0
           max_instability: 0.75
+          max_efferent_coupling: 12
         baseline_path: .cartograph-baseline.json
         external_retentions_path: .isthmus/retentions.cartograph.json
         derived_data_path: DerivedData
@@ -53,6 +54,7 @@ struct ConfigurationLoaderTests {
         #expect(configuration.rules.first?.deny == ["Data"])
         #expect(configuration.thresholds.maxCycles == 0)
         #expect(configuration.thresholds.maxInstability == 0.75)
+        #expect(configuration.thresholds.maxEfferentCoupling == 12)
         #expect(configuration.baselinePath == ".cartograph-baseline.json")
         #expect(configuration.externalRetentionsPath == ".isthmus/retentions.cartograph.json")
         #expect(configuration.derivedDataPath == "DerivedData")
@@ -154,6 +156,20 @@ struct ConfigurationLoaderTests {
         #expect(rule.rationale == "Views stay testable without a database.")
         #expect(rule.hint == nil)
         #expect(!result.warnings.contains { $0.contains("rationale") || $0.contains("hint") })
+    }
+
+    @Test("음수 원심 결합도 상한은 경로와 이유를 담은 설정 오류가 된다")
+    func rejectsNegativeEfferentCouplingLimit() {
+        let yaml = """
+            thresholds:
+              max_efferent_coupling: -1
+            """
+        #expect {
+            try ConfigurationLoader().load(yaml: yaml, path: "/p/.cartograph.yml")
+        } throws: { error in
+            let message = (error as? CartographError)?.errorDescription ?? ""
+            return message.contains("/p/.cartograph.yml") && message.contains("max_efferent_coupling must be 0 or greater")
+        }
     }
 
     @Test("잘못된 타입은 고칠 위치를 알려 주는 오류가 된다")
