@@ -17,6 +17,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `details` lines in the `text` and `json` reports and under `rules --explain`. A bare violation
   invites the shortest edit that gets around the rule, especially from a coding agent; the team's
   reasoning now reaches whoever fixes it. Neither field is part of the baseline fingerprint.
+- `affected --format xcodebuild` prints the reached tests as `-only-testing:` arguments so CI can run
+  only them. A wrong identifier makes xcodebuild run zero tests and pass, so only identifiers the
+  graph proves are narrowed — top-level XCTest classes without subclasses whose runtime name is their
+  source name, and their parameterless `test…` methods (checked against real `xcodebuild test` runs:
+  a base-class identifier skipped the subclass's inherited test, and an unknown class ran zero tests
+  and passed). Swift Testing functions, nested or `@objc`-renamed classes and filtered graphs select
+  their whole test module, and a truncated or unresolved answer prints no arguments and exits 2. The JSON
+  document carries the proven identifier as `xcodebuildIdentifier`.
 
 ## [0.22.0] - 2026-09-24
 
