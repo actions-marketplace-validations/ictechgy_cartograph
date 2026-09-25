@@ -1,5 +1,7 @@
 # Cartograph
 
+<img src="icon.png" alt="cartograph's swift mascot" width="112" height="112" align="right">
+
 **A queryable dependency graph for Swift and iOS codebases.**
 
 [한국어 문서](README.ko.md)
@@ -43,6 +45,7 @@ What that buys you:
 | What will this change affect? | — | `impact` finds direct and transitive consumers before editing |
 | How does a value reach this function? | not answerable | `dataflow` returns bounded interprocedural contexts as JSON |
 | Callers in Dart or JavaScript | invisible | `bridges` exports the Swift side of a platform channel; `--external-retentions` reads the join back |
+| Which tables does this code touch? | invisible | `schema` exports `relation-use` facts for isthmus to join with the SQL catalog |
 | Runtime or dispatch-only risk | — | `impact` marks runtime review targets and dispatch contracts |
 | Graph export | — | ✅ DOT, Mermaid, JSON, self-contained HTML |
 | SARIF for code scanning | — | ✅ |
@@ -70,7 +73,7 @@ brew install ictechgy/tap/cartograph
 **Mint** — builds from source, no tap to add:
 
 ```bash
-mint install ictechgy/cartograph@0.21.0
+mint install ictechgy/cartograph@0.22.0
 ```
 
 **No install at all** — for a Swift package, add Cartograph as a dependency and use the command
@@ -78,7 +81,7 @@ plugin. Everyone on the team and CI then runs the same version:
 
 ```swift
 // Package.swift
-.package(url: "https://github.com/ictechgy/cartograph", revision: "0.21.0"),
+.package(url: "https://github.com/ictechgy/cartograph", revision: "0.22.0"),
 ```
 
 ```bash
@@ -691,7 +694,7 @@ of a PR was checked.
 `2026-07-28` requests with per-request `_meta` protocol and client-capabilities fields, plus the
 legacy initialization versions supported by the protocol. The session is created lazily, so
 discover and tool listing work before a project is built. `cartograph_status`, `cartograph_query`,
-`cartograph_impact`, `cartograph_check` and `cartograph_runtime_discover` return `{ "session": ..., "result": ... }` envelopes
+`cartograph_impact`, `cartograph_affected`, `cartograph_check` and `cartograph_runtime_discover` return `{ "session": ..., "result": ... }` envelopes
 (status returns metadata directly), and refresh automatically when indexed inputs change. Input
 fingerprints are automatically re-verified at most once per second; calls inside that window
 are answered by the last verified generation. `--session-freshness-interval <seconds>` tunes the window
@@ -982,7 +985,7 @@ $ cartograph bridges
   "platform" : "swift",
   "project" : "/app/ios",
   "target" : "flutter",
-  "tool" : { "name" : "cartograph", "version" : "0.21.0" },
+  "tool" : { "name" : "cartograph", "version" : "0.22.0" },
   "version" : 1
 }
 ```
@@ -1037,6 +1040,34 @@ A path that is configured but missing is a tool failure (exit 2), not a silent n
 supplied the file expects it to be applied. `query` lists the file's provenance under
 `limitations`, along with how many of its retentions name no declaration in the index — a renamed
 handler shows up there before it shows up as a bug.
+
+### `schema` — export database relation references
+
+```bash
+cartograph schema                        # persistence bridge-facts JSON on stdout
+cartograph schema --format text          # one line per fact, for a quick look
+```
+
+A Swift file that runs `sqlite3_prepare_v2(db, "DELETE FROM sessions …")` references a table the
+compiler index knows nothing about — the name only ever exists inside a string literal. `schema`
+reads those literals out of the sources and writes `relation-use` facts in the same `bridge-facts`
+exchange format, with `target: "persistence"`, so [isthmus](../isthmus) can join them against the
+`relation-decl` facts schemagraph produces from the live catalog: code that references a dropped
+table, or a table no code touches, becomes a check finding instead of a guess.
+
+The covered surface is evidence-gated by import: sqlite3 C API arguments, GRDB `sql:` arguments,
+`Table(…)` and `static let/var databaseTableName`, SQLite.swift `Table`/`prepare`/`run`, Fluent
+`schema`/`query(_:)` and `static let schema`, plus ungated uppercase SQL literals anywhere. Core
+Data, SwiftData, Realm and other database frameworks are counted under `limitations` rather than
+read — entity names are not SQL catalog relations, and emitting them as facts would produce
+diagnostics for declarations that were never supposed to exist. SQL arguments that are not
+literals, and relation names that cannot be resolved statically, stay in the document marked
+`dynamic` so the join can count what it could not see.
+
+Like `bridges`, the command attaches the index's USR to the enclosing declaration when it can,
+so isthmus retentions can name the function that touches a table. Facts at file scope carry no
+symbol. The command refuses `--since`, `--level`, `--report-format` and `--strict` for the same
+reasons `bridges` does: the document is a complete boundary export, not a finding.
 
 ### `skill` — teach a coding agent to use this
 
@@ -1303,12 +1334,11 @@ override the extension's default access.
   The conservative `retain_objc_accessible` default remains; unindexed sources remain a gap.
 - **Callers in another language are known only through isthmus.** `bridges` exports what Swift
   declares; whether Dart or JavaScript actually calls it is a join this tool does not perform.
-- **A property that is only ever assigned counts as used.** The graph has one `reference` edge
-  kind and does not carry the index's read/write distinction, so `counter.neverRead = 1` looks
-  exactly like reading it. In a four-line package where `bump()` assigns `neverRead` and nothing
-  ever reads it, `dead` reports nothing and `query` answers `reachable`, used by `bump()`. Deleting
-  such a property is safe and this tool will not suggest it. Telling the two apart needs read and
-  write edge kinds, which the graph does not have yet.
+- **Assignment still counts as a use in the graph.** `dead` reports a property that is only ever
+  assigned as an `assign-only` warning, using the read/write roles the index records (see `dead`).
+  The graph itself has one `reference` edge kind, though, so `counter.neverRead = 1` still makes
+  `bump()` a user of `neverRead`: `query` answers `reachable`, and `impact` and `graph` show the
+  edge. Read the warning together with those answers rather than expecting them to agree.
 - **`#if` branches that did not compile do not exist.** The index store only knows the
   configuration you built.
 
@@ -1345,11 +1375,11 @@ jobs:
       - uses: ictechgy/cartograph@action-v1.0.0
         with:
           command: check
-          version: 0.21.0
+          version: 0.22.0
           args: --since ${{ github.event.pull_request.base.sha || github.event.before }}
 ```
 
-The `action-v1.0.0` tag is the action release; `version: 0.21.0` selects the CLI binary.
+The `action-v1.0.0` tag is the action release; `version: 0.22.0` selects the CLI binary.
 Pin both for a repeatable setup (`@main` tracks the development branch). Marketplace's default
 "Use latest version" currently follows the repository's latest CLI release; select
 `action-v1.0.0` or use the version-specific link above for the action release. Inputs:

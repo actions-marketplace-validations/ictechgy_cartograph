@@ -1,5 +1,7 @@
 # Cartograph
 
+<img src="icon.png" alt="cartograph의 칼새 마스코트" width="112" height="112" align="right">
+
 **Swift·iOS 코드베이스의 의존성 그래프에 질문을 던지는 도구.**
 
 [English](README.md)
@@ -45,6 +47,7 @@ Cartograph의 문장은 *"의존성 그래프를 내놓는다"*이며, 미사용
 | 이 변경이 무엇에 영향을 주나? | — | `impact`가 편집 전에 직접·전이 소비자를 찾음 |
 | 이 값이 이 함수까지 어떻게 오나? | 답할 수 없음 | `dataflow`가 한정된 함수 간 문맥을 JSON으로 답함 |
 | Dart·JavaScript 쪽 호출자 | 보이지 않음 | `bridges`가 플랫폼 채널의 Swift 쪽을 내보내고 `--external-retentions`가 조인 결과를 읽어 옴 |
+| 이 코드가 어떤 테이블을 건드는가 | 보이지 않음 | `schema`가 `relation-use` 사실을보내 isthmus가 SQL 카탈로그와 조인함 |
 | 런타임·디스패치 전용 위험 | — | `impact`가 런타임 검토 대상과 디스패치 계약을 표시함 |
 | 그래프 내보내기 | — | ✅ DOT, Mermaid, JSON, 단일 HTML |
 | SARIF(code scanning) | — | ✅ |
@@ -73,7 +76,7 @@ brew install ictechgy/tap/cartograph
 **Mint** — 소스에서 빌드되며, tap을 추가할 필요가 없습니다.
 
 ```bash
-mint install ictechgy/cartograph@0.21.0
+mint install ictechgy/cartograph@0.22.0
 ```
 
 **아예 설치하지 않기** — Swift 패키지라면 의존성으로 추가해 커맨드 플러그인을 씁니다.
@@ -81,7 +84,7 @@ mint install ictechgy/cartograph@0.21.0
 
 ```swift
 // Package.swift
-.package(url: "https://github.com/ictechgy/cartograph", revision: "0.21.0"),
+.package(url: "https://github.com/ictechgy/cartograph", revision: "0.22.0"),
 ```
 
 ```bash
@@ -674,7 +677,7 @@ cartograph check --report-format json
 `serve`는 stdio만 사용하며 네트워크나 서버 주도 요청을 만들지 않습니다. 최신 `2026-07-28`
 요청의 요청별 `_meta` 프로토콜·클라이언트 능력 필드와 지원되는 레거시 초기화를 함께
 받습니다. 세션은 늦게 만들어 빌드 전에도 discover와 도구 목록을 제공합니다.
-`cartograph_status`, `cartograph_query`, `cartograph_impact`, `cartograph_check`,
+`cartograph_status`, `cartograph_query`, `cartograph_impact`, `cartograph_affected`, `cartograph_check`,
 `cartograph_runtime_discover`는 `{ "session": ..., "result": ... }` 봉투를 쓰고(status는
 메타데이터를 직접 반환), 인덱스 입력이 바뀌면 다시 준비합니다. 입력 지문은 자동으로
 최대 1초에 한 번만 다시 검증하며, 그 창 안의 호출은 마지막으로 검증된 세대로 응답합니다.
@@ -957,7 +960,7 @@ $ cartograph bridges
   "platform" : "swift",
   "project" : "/app/ios",
   "target" : "flutter",
-  "tool" : { "name" : "cartograph", "version" : "0.21.0" },
+  "tool" : { "name" : "cartograph", "version" : "0.22.0" },
   "version" : 1
 }
 ```
@@ -998,6 +1001,33 @@ App.CameraPlugin is retained because its member App.init(messenger:) is called f
 지정했는데 없는 파일은 조용히 넘어가지 않고 도구 실패(종료 코드 2)입니다. 파일을 준 사람은
 그것이 반영되기를 기대합니다. `query`는 `limitations`에 파일의 출처와, 인덱스의 어느 선언과도
 맞지 않는 근거의 수를 싣습니다. 이름을 바꾼 핸들러는 버그가 되기 전에 거기서 먼저 드러납니다.
+
+### `schema` — 데이터베이스 관계 참조 보내기
+
+```bash
+cartograph schema                        # persistence bridge-facts JSON을 표준 출력으로
+cartograph schema --format text          # 사실마다 한 줄, 훑어보기용
+```
+
+`sqlite3_prepare_v2(db, "DELETE FROM sessions …")`를 실행하는 Swift 파일은 컴파일러 인덱스가
+모르는 테이블을 참조합니다 — 그 이름은 문자열 리터럴 안에만 존재합니다. `schema`는 소스에서 그
+리터럴을 읽어 `target: "persistence"`인 `relation-use` 사실로 같은 `bridge-facts` 교환 형식에
+담습니다. 그러면 [isthmus](../isthmus)가 schemagraph가 라이브 카탈로그에서 낸 `relation-decl`
+사실과 조인해, 삭제된 테이블을 참조하는 코드나 아무 코드도 건드리지 않는 테이블이 추측이 아니라
+check 발견이 됩니다.
+
+읽는 표면은 import로 게이트됩니다: sqlite3 C API 인자, GRDB `sql:` 인자·`Table(…)`·
+`static let/var databaseTableName`, SQLite.swift `Table`/`prepare`/`run`, Fluent
+`schema`/`query(_:)`·`static let schema`, 그리고 어디에 있든 게이트 없는 대문자 SQL 리터럴.
+Core Data·SwiftData·Realm과 나머지 DB 프레임워크는 읽지 않고 `limitations`에 관측 개수로
+남깁니다 — 엔티티 이름은 SQL 카탈로그의 관계가 아니므로, 사실로 만들면 존재하지 않는 선언을
+찾는 진단이 됩니다. 리터럴이 아닌 SQL 인자와 정적으로 풀 수 없는 관계 이름은 문서에 `dynamic`
+표식으로 남겨, 조인이 보지 못한 것을 셀 수 있게 합니다.
+
+`bridges`처럼 인덱스의 USR을 감싸는 선언에 붙일 수 있으면 붙입니다 — isthmus 보존 근거가
+테이블을 건드는 함수를 가리킬 수 있게. 파일 최상위의 사실은 심볼을 싣지 않습니다.
+`--since`, `--level`, `--report-format`, `--strict`를 거부하는 이유도 `bridges`와 같습니다:
+이 문서는 발견 목록이 아니라 경계의 전체보내기입니다.
 
 ### `skill` — 코딩 에이전트에게 이 도구 쓰는 법 설치하기
 
@@ -1264,12 +1294,11 @@ Periphery는 둘 다 꺼져 있습니다. 합성된 `==`나 `hash(into:)`만 읽
   `retain_objc_accessible`의 보수적 기본값은 유지합니다. 인덱스가 없는 소스는 여전히 공백입니다.
 - **다른 언어의 호출자는 isthmus를 통해서만 압니다.** `bridges`는 Swift가 선언한 것을
   내보낼 뿐이고, Dart나 JavaScript가 실제로 부르는지는 이 도구가 하지 않는 조인입니다.
-- **대입만 되는 프로퍼티는 쓰이는 것으로 셉니다.** 그래프의 참조 간선은 한 종류뿐이라
-  인덱스의 읽기/쓰기 구분을 싣지 않습니다. `counter.neverRead = 1`이 읽는 것과 똑같이
-  보입니다. `bump()`가 `neverRead`에 대입만 하고 아무도 읽지 않는 네 줄짜리 패키지에서
-  `dead`는 아무것도 보고하지 않고 `query`는 `reachable`, 사용처는 `bump()`라고 답합니다.
-  그런 프로퍼티는 지워도 안전하지만 이 도구는 알려 주지 않습니다. 가르려면 읽기·쓰기
-  간선이 필요하고 아직 없습니다.
+- **그래프에서는 대입도 사용으로 셉니다.** `dead`는 인덱스가 남기는 read/write 역할로
+  대입만 되는 프로퍼티를 `assign-only` 경고로 보고합니다(`dead` 절 참고). 하지만 그래프의
+  참조 간선은 한 종류뿐이라 `counter.neverRead = 1`만 있어도 `bump()`는 `neverRead`의
+  사용처가 됩니다. `query`는 `reachable`이라고 답하고 `impact`와 `graph`에도 그 간선이
+  보입니다. 경고와 이 답들이 일치하리라 기대하지 말고 함께 읽으세요.
 - **컴파일되지 않은 `#if` 분기는 존재하지 않습니다.** 인덱스 스토어는 실제로 빌드한 구성만
   압니다.
 
@@ -1306,11 +1335,11 @@ jobs:
       - uses: ictechgy/cartograph@action-v1.0.0
         with:
           command: check
-          version: 0.21.0
+          version: 0.22.0
           args: --since ${{ github.event.pull_request.base.sha || github.event.before }}
 ```
 
-`action-v1.0.0`은 액션 릴리스 태그이고, `version: 0.21.0`은 CLI 바이너리를 선택합니다.
+`action-v1.0.0`은 액션 릴리스 태그이고, `version: 0.22.0`은 CLI 바이너리를 선택합니다.
 재현 가능한 실행을 위해 둘을 함께 고정하세요(`@main`은 개발 브랜치를 따릅니다).
 Marketplace의 기본 "Use latest version"은 저장소의 최신 CLI 릴리스를 따릅니다.
 액션 릴리스를 쓰려면 `action-v1.0.0`을 선택하거나 위의 버전별 링크를 이용하세요. 입력:
