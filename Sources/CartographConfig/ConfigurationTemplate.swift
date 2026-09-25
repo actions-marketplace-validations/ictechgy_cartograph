@@ -61,6 +61,8 @@ public enum ConfigurationTemplate {
         #  - name: Presentation must not reach the data layer directly
         #    from: Presentation
         #    deny: [Data]
+        #    rationale: Views stay testable without a database.      # optional, shown with violations
+        #    hint: Inject a use case from the Domain layer instead.   # optional, shown with violations
         #  - from: Domain
         #    allow: []
 
@@ -70,6 +72,7 @@ public enum ConfigurationTemplate {
         #  max_rule_violations: 0
         #  max_instability: 0.8
         #  max_distance: 0.7
+        #  max_efferent_coupling: 8      # distinct nodes one node may depend on (Ce)
 
         # baseline_path: \(Cartograph.defaultBaselineFileName)
         # Retentions produced by `isthmus retentions --for cartograph`, for handlers that

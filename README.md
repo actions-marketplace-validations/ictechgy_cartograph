@@ -643,6 +643,39 @@ that existing tests cover the behavior, and every response carries that sentence
 limitations. Selection, container expansion, dispatch projection and depth limits are the same
 plumbing `impact` uses, so the two commands cannot disagree about the same change.
 
+`--format xcodebuild` turns the answer into `-only-testing:` arguments, one per line, ready for a
+script:
+
+```bash
+xcodebuild test -scheme App $(cartograph affected --since origin/main --format xcodebuild)
+```
+
+```console
+$ cartograph affected negate --format xcodebuild
+-only-testing:CalcTests/AddTests/testNegate
+```
+
+A wrong class or method is worse than none — given an unknown class, xcodebuild runs zero tests and
+reports success (measured with Xcode 27.0) — so only identifiers the graph proves are narrowed. A
+test class is narrowed to `Module/Class`, and a test method to `Module/Class/method`, only when the
+class is a top-level XCTest class with no subclass (a subclass runs the inherited test under its own
+name, which the base-class identifier skips) whose Objective-C runtime name is its source name, and
+the method is a parameterless `test…` method the index marks as an XCTest. Every other reached test
+selects its whole test module: swift-testing functions, whose identifier format has varied between
+Xcode releases, nested classes, classes renamed with `@objc(…)`, and graphs narrowed by
+`edge_kinds` or path filters, where a subclass may be invisible. Standard error says how many tests
+were widened this way, followed by the analysis limitations.
+
+The module name stands in for the xcodebuild test target name. They match for SwiftPM test targets
+and for Xcode targets whose names are valid identifiers; a target named `My App Tests` has the
+module `My_App_Tests`. Unlike an unknown class, an unknown target is a loud failure — xcodebuild
+stops with "isn't a member of the specified test plan or scheme" — so such a project sees the
+mismatch rather than a silently empty run; use the JSON output there. When the list is truncated by `--limit` or
+`--depth`, or an input is unresolved, the command prints no arguments and exits 2 (unresolved named
+declarations still exit 64) — with no `-only-testing:` argument xcodebuild runs every test, which is
+the safe side. No reached test also prints nothing and exits 0; check `summary.testCount` in the JSON
+if skipping the test run is the intent.
+
 ### `snapshot` — capture an analysis input
 
 ```bash
@@ -1111,6 +1144,13 @@ cartograph              0   3  1.00  0.00  0.00  main-sequence
 `CartographCore` sitting deep in the zone of pain is honest: it is a concrete domain model that
 everything depends on. The metric is a question to answer, not a rule to obey.
 
+When a metric does need a ceiling, `thresholds` in `.cartograph.yml` turns it into warnings:
+`max_instability` and `max_distance` bound the ratios, and `max_efferent_coupling` bounds Ce itself.
+Instability is a ratio, so a module that depends on three others and one that depends on thirty
+can both read 1.00; the absolute count is what catches a module reaching into every layer.
+Isolated nodes are never flagged, and `metrics --strict` fails the run when a warning remains.
+`check` does not evaluate metric thresholds; run `metrics --strict` as its own CI step.
+
 ### `rules` — enforce architecture in CI
 
 ```yaml
@@ -1149,6 +1189,26 @@ CartographKit is in layer 'Assembly'.
   rules from 'Assembly':
     the assembly layer does not know about the interface
 ```
+
+A rule can carry an optional `rationale` (why the rule exists) and `hint` (how to fix a violation).
+A bare violation invites the shortest edit that gets around the rule, especially from a coding agent
+that turns reports straight into edits; the team's reasoning has to travel with the finding for the
+fix to match the intent.
+
+```yaml
+rules:
+  - name: Presentation must not reach the data layer directly
+    from: Presentation
+    deny: [Data]
+    rationale: Views stay testable without a database.
+    hint: Inject a use case from the Domain layer instead.
+```
+
+Both appear as `rationale:` and `hint:` lines in the violation's `details`, which the `text` and
+`json` reports print, and under `--explain`. Formats that carry a single message line (`xcode`,
+`github-actions`, `checkstyle`, `sarif`) do not show them. Multi-line values are folded onto one
+line and empty values count as absent. Neither is part of the baseline fingerprint, so rewording
+them never invalidates a baseline.
 
 ### `baseline` — adopt on an existing codebase
 
@@ -1227,6 +1287,7 @@ thresholds:
   max_rule_violations: 0
   max_instability: 0.9
   max_distance: 0.8
+  max_efferent_coupling: 8   # distinct nodes one node may depend on (Ce)
 
 baseline_path: .cartograph-baseline.json    # where --baseline READS suppression findings;
                                             # `cartograph baseline` writes only via --write or the

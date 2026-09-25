@@ -628,6 +628,37 @@ affected: 2 test declaration(s) reach this change — 11 affected symbol(s), 1 t
 아니며, 모든 응답에 그 문장과 분석 한계가 함께 실립니다. 시드 선택·컨테이너 확장·디스패치 투영·
 깊이 제한은 `impact`와 같은 배관을 쓰므로, 같은 변경에 대해 두 명령이 다른 답을 내지 않습니다.
 
+`--format xcodebuild`는 답을 `-only-testing:` 인자로 바꿔 한 줄에 하나씩 출력합니다. 스크립트에
+그대로 넘길 수 있습니다:
+
+```bash
+xcodebuild test -scheme App $(cartograph affected --since origin/main --format xcodebuild)
+```
+
+```console
+$ cartograph affected negate --format xcodebuild
+-only-testing:CalcTests/AddTests/testNegate
+```
+
+틀린 클래스나 메서드는 없는 것보다 나쁩니다 — 없는 클래스를 받은 xcodebuild는 테스트를 하나도
+돌리지 않고 성공으로 끝납니다(Xcode 27.0 실측). 그래서 그래프가 증명한 식별자만 좁힙니다. 테스트
+클래스가 `Module/Class`로, 테스트 메서드가 `Module/Class/method`로 좁혀지는 것은 그 클래스가 하위
+클래스 없는 최상위 XCTest 클래스이고(하위 클래스는 상속한 테스트를 자기 이름으로 실행하므로 상위
+클래스 식별자로는 빠집니다) Objective-C 런타임 이름이 소스 이름과 같으며, 메서드가 인덱스가 XCTest로
+표시한 인자 없는 `test…` 메서드일 때뿐입니다. 그 밖에 도달한 테스트는 테스트 모듈 전체를 고릅니다 —
+Xcode 릴리스마다 식별자 형식이 달라진 swift-testing 함수, 중첩 클래스, `@objc(…)`로 이름을 바꾼
+클래스, 그리고 `edge_kinds`나 경로 필터로 좁혀 하위 클래스가 안 보일 수 있는 그래프가 그렇습니다.
+이렇게 넓힌 테스트 수와 분석 한계는 표준 오류로 알립니다.
+
+모듈 이름을 xcodebuild 테스트 타깃 이름으로 씁니다. SwiftPM 테스트 타깃과, 이름이 올바른 식별자인
+Xcode 타깃에서는 둘이 같습니다. `My App Tests` 타깃의 모듈은 `My_App_Tests`입니다. 없는 클래스와
+달리 없는 타깃은 요란하게 실패합니다 — xcodebuild가 "isn't a member of the specified test plan or
+scheme"으로 멈추므로, 그런 프로젝트는 조용히 빈 실행이 아니라 불일치를 봅니다. 그때는 JSON 출력을
+쓰세요. `--limit`·`--depth`로 목록이 잘렸거나 풀지 못한 입력이 있으면 인자를 하나도 출력하지 않고
+종료 코드 2로 끝납니다(이름을 찾지 못한 선언은 여전히 64) — `-only-testing:` 인자가 없으면
+xcodebuild는 모든 테스트를 돌리므로 그쪽이 안전합니다. 닿는 테스트가 없을 때도 아무것도 출력하지
+않고 0으로 끝납니다. 테스트 실행을 건너뛰려는 목적이면 JSON의 `summary.testCount`를 확인하세요.
+
 ### `snapshot` — 분석 입력 캡처
 
 ```bash
@@ -1071,6 +1102,13 @@ cartograph              0   3  1.00  0.00  0.00  main-sequence
 `CartographCore`가 zone-of-pain 깊숙이 자리한 것은 예상대로입니다 — 모두가 의존하는 구체적인
 도메인 모델이기 때문입니다. 지표는 따라야 할 규칙이 아니라 답해야 할 질문입니다.
 
+지표에 상한이 꼭 필요하면 `.cartograph.yml`의 `thresholds`가 경고로 바꿔 줍니다. `max_instability`와
+`max_distance`는 비율의 상한이고, `max_efferent_coupling`은 Ce 자체의 상한입니다. 불안정도는
+비율이라 셋에 의존하는 모듈과 서른에 의존하는 모듈이 모두 1.00으로 읽힐 수 있습니다. 모든
+계층에 손을 뻗는 모듈을 잡는 것은 절대 개수입니다. 고립 정점은 판정하지 않으며, 경고가 남으면
+`metrics --strict`가 실행을 실패시킵니다.
+`check`는 지표 임계값을 평가하지 않으므로 CI에서는 `metrics --strict`를 별도 단계로 돌리세요.
+
 ### `rules` — CI에서 아키텍처 강제
 
 ```yaml
@@ -1111,6 +1149,25 @@ CartographKit is in layer 'Assembly'.
   rules from 'Assembly':
     조립 계층은 인터페이스를 알지 못한다
 ```
+
+규칙에는 선택 필드 `rationale`(왜 이 규칙이 있는지)과 `hint`(위반을 어떻게 고치는지)를 적을 수
+있습니다. 위반만 알리면 읽는 쪽 — 특히 결과를 곧바로 편집으로 옮기는 코딩 에이전트 — 은 규칙을
+피해 가는 가장 짧은 편집을 고릅니다. 팀이 적은 이유와 안내가 함께 가야 의도에 맞는 수정을
+고를 수 있습니다.
+
+```yaml
+rules:
+  - name: 프레젠테이션은 데이터 계층에 직접 접근하지 않는다
+    from: Presentation
+    deny: [Data]
+    rationale: 뷰는 데이터베이스 없이 테스트할 수 있어야 한다.
+    hint: Domain 계층의 유스케이스를 주입해 쓰세요.
+```
+
+두 값은 위반 진단의 `details`에 `rationale:`·`hint:` 줄로 실려 `text`와 `json` 리포트에 나오고,
+`--explain`에도 보입니다. 한 줄 메시지만 싣는 형식(`xcode`, `github-actions`, `checkstyle`,
+`sarif`)에는 나오지 않습니다. 여러 줄로 적으면 한 줄로 접고, 빈 값은 적지 않은 것으로 봅니다.
+베이스라인 지문에는 들어가지 않으므로 문구를 고쳐도 기존 베이스라인이 깨지지 않습니다.
 
 ### `baseline` — 기존 코드베이스에 도입하기
 
@@ -1190,6 +1247,7 @@ thresholds:
   max_rule_violations: 0
   max_instability: 0.9
   max_distance: 0.8
+  max_efferent_coupling: 8   # 정점 하나가 의존해도 되는 서로 다른 정점 수(Ce)
 
 baseline_path: .cartograph-baseline.json    # 억제 발견을 읽어 오는 위치.
                                             # `cartograph baseline`은 --write 또는
